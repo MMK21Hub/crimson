@@ -1,6 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use postgres::{Client, NoTls};
+use reqwest::Url;
+use serde::Deserialize;
 use time::macros::{datetime, format_description};
 use time::{OffsetDateTime, PrimitiveDateTime};
 
@@ -38,6 +40,17 @@ fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let db_url =
         std::env::var("DATABASE_URL").context("DATABASE_URL environment variable not set")?;
+    let flavortown_api = std::env::var("FLAVORTOWN_API_BASE")
+        .context("FLAVORTOWN_API_BASE environment variable not set")?;
+    let flavortown_api =
+        Url::parse(&flavortown_api).context("FLAVORTOWN_API_BASE is not a valid URL")?;
+    if flavortown_api.path().trim_end_matches("/") != "/api/v1" {
+        println!(
+            "Warning: FLAVORTOWN_API_BASE does not end in `/api/v1`. Are you sure you have the full URL?"
+        );
+    }
+    let flavortown_api_key = std::env::var("FLAVORTOWN_API_KEY")
+        .context("FLAVORTOWN_API_KEY environment variable not set")?;
     let args = CrimsonArgs::parse();
     let command_args: &PayoutArgs = match &args.command {
         Command::Payout(p) => p,
@@ -54,11 +67,13 @@ fn main() -> anyhow::Result<()> {
         end - start
     );
 
-    let client = Client::connect(&db_url, NoTls)?;
+    // let client =
+    //     Client::connect(&db_url, NoTls).context("Failed to connect to Nephthys database")?;
 
-    let x = get_helper_leaderboard(client, start, end)?;
-
-    println!("{:#?}", x);
+    // let x = get_helper_leaderboard(client, start, end)?;
+    let users = get_flavortown_users(&flavortown_api, &flavortown_api_key, "U073M5L9U13")?.users;
+    let user = users.get(0).context("Flavortown API returned no users")?;
+    println!("Flavortown user: {:?}", user);
 
     Ok(())
 }
@@ -95,4 +110,46 @@ fn get_helper_leaderboard(
         .collect::<std::collections::HashMap<String, i64>>();
 
     return Ok(hashmap);
+}
+
+#[derive(Deserialize, Debug)]
+struct FlavortownUser {
+    id: i64,
+    slack_id: String,
+    display_name: String,
+    avatar: String,
+    project_ids: Vec<i64>,
+    cookies: Option<i64>,
+}
+#[derive(Deserialize, Debug)]
+struct FlavortownUsersResponse {
+    users: Vec<FlavortownUser>,
+}
+
+fn get_flavortown_users(
+    flavortown_api: &Url,
+    flavortown_api_key: &str,
+    query: &str,
+) -> Result<FlavortownUsersResponse, anyhow::Error> {
+    let client = reqwest::blocking::Client::new();
+    let mut url = flavortown_api.join("users")?;
+    url.query_pairs_mut().append_pair("query", query);
+    println!("Fetching users from Flavortown API: {}", url);
+    let response = client
+        .get(url)
+        .header("Authorization", format!("Bearer {}", flavortown_api_key))
+        .send()
+        .context("Failed to fetch users from Flavortown API")?;
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "Flavortown API returned error: {} - {}",
+            response.status(),
+            response.text().unwrap_or_default()
+        ));
+    }
+    let data: FlavortownUsersResponse = response
+        .json()
+        .context("Invalid users response from Flavortown API")?;
+
+    Ok(data)
 }
