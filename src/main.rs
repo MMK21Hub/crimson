@@ -85,17 +85,13 @@ fn main() -> anyhow::Result<()> {
             .get(0)
             .context("Flavortown API returned no users")?;
         println!(
-            "{}: {} gets {} cookies! ({} tkts)",
+            "{}: {} gets {} cookies! ({} tkts)\n",
             user.display_name,
-            slack_id,
+            format!("https://flavortown.hackclub.com/admin/users/{}", user.id),
             cookies,
             helper_tickets.get(*slack_id).unwrap_or(&0)
         );
     }
-
-    let users = get_flavortown_users(&flavortown_api, &flavortown_api_key, "U073M5L9U13")?.users;
-    let user = users.get(0).context("Flavortown API returned no users")?;
-    println!("Flavortown user: {:?}", user);
 
     Ok(())
 }
@@ -156,7 +152,6 @@ fn get_flavortown_users(
     let client = reqwest::blocking::Client::new();
     let mut url = flavortown_api.join("users")?;
     url.query_pairs_mut().append_pair("query", query);
-    println!("Fetching users from Flavortown API: {}", url);
     let response = client
         .get(url)
         .header("Authorization", format!("Bearer {}", flavortown_api_key))
