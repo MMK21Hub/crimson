@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use postgres::{Client, NoTls};
@@ -67,10 +69,30 @@ fn main() -> anyhow::Result<()> {
         end - start
     );
 
-    // let client =
-    //     Client::connect(&db_url, NoTls).context("Failed to connect to Nephthys database")?;
+    let client =
+        Client::connect(&db_url, NoTls).context("Failed to connect to Nephthys database")?;
 
-    // let x = get_helper_leaderboard(client, start, end)?;
+    let helper_tickets = get_helper_leaderboard(client, start, end)?;
+    let helper_cookies: HashMap<&String, f64> = helper_tickets
+        .iter()
+        .map(|(id, tickets)| (id, (*tickets as f64) * 0.5))
+        .collect();
+
+    for (slack_id, cookies) in helper_cookies.iter() {
+        let matching_users =
+            get_flavortown_users(&flavortown_api, &flavortown_api_key, slack_id)?.users;
+        let user = matching_users
+            .get(0)
+            .context("Flavortown API returned no users")?;
+        println!(
+            "{}: {} gets {} cookies! ({} tkts)",
+            user.display_name,
+            slack_id,
+            cookies,
+            helper_tickets.get(*slack_id).unwrap_or(&0)
+        );
+    }
+
     let users = get_flavortown_users(&flavortown_api, &flavortown_api_key, "U073M5L9U13")?.users;
     let user = users.get(0).context("Flavortown API returned no users")?;
     println!("Flavortown user: {:?}", user);
@@ -82,7 +104,7 @@ fn get_helper_leaderboard(
     mut client: Client,
     start: OffsetDateTime,
     end: OffsetDateTime,
-) -> Result<std::collections::HashMap<String, i64>, anyhow::Error> {
+) -> Result<HashMap<String, i64>, anyhow::Error> {
     let start_time = start;
     let end_time = end;
     let rows = client.query(
@@ -100,14 +122,14 @@ fn get_helper_leaderboard(
         &[&start_time, &end_time],
     )?;
 
-    let hashmap = rows
+    let hashmap: HashMap<String, i64> = rows
         .iter()
         .map(|row| {
             let slack_id: &str = row.get("slack_id");
             let tickets_closed: i64 = row.get("tickets_closed");
             (slack_id.to_string(), tickets_closed)
         })
-        .collect::<std::collections::HashMap<String, i64>>();
+        .collect();
 
     return Ok(hashmap);
 }
