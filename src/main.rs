@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use postgres::{Client, NoTls};
 use reqwest::Url;
 use serde::Deserialize;
-use time::macros::{datetime, format_description};
-use time::{OffsetDateTime, PrimitiveDateTime};
+use time::OffsetDateTime;
+use time::macros::format_description;
 
 #[derive(Parser)]
 struct CrimsonArgs {
@@ -131,6 +131,7 @@ fn get_helper_leaderboard(
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct FlavortownUser {
     id: i64,
     slack_id: String,
