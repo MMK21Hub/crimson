@@ -2,6 +2,8 @@
 
 A Rust tool to calculate cookie payouts for the [Flavortown](https://flavortown.hackclub.com/) support team.
 
+Named _Crimson_ because we want to avoid any _Corruption_ when giving payouts.
+
 ## Usage
 
 Fill out `.env` file:
