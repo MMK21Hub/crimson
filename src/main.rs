@@ -160,7 +160,13 @@ fn print_helper_cookies(
     );
     println!();
 
-    for (slack_id, cookies) in helper_cookies.iter() {
+    let mut helper_cookies_vec: Vec<(&&String, &f64)> = helper_cookies.iter().collect();
+    helper_cookies_vec.sort_by(|(_, cookies_a), (_, cookies_b)| {
+        cookies_b
+            .partial_cmp(cookies_a)
+            .expect("unexpected unorderable float")
+    });
+    for (slack_id, cookies) in helper_cookies_vec {
         let matching_users =
             get_flavortown_users(&flavortown_api, &flavortown_api_key, slack_id)?.users;
         let user = matching_users
@@ -170,7 +176,7 @@ fn print_helper_cookies(
             "{}: {} gets {} cookies! ({} tkts)\n",
             user.display_name,
             format!("https://flavortown.hackclub.com/admin/users/{}", user.id),
-            cookies,
+            (*cookies as f32), // use f32 to reduce the chances of .0000000000001
             helper_tickets.get(*slack_id).unwrap_or(&0)
         );
     }
