@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Ok, Result};
 use clap::{Args, Parser, Subcommand};
 use postgres::{Client, NoTls};
 use reqwest::Url;
@@ -28,6 +28,20 @@ struct PayoutArgs {
     /// End time (ISO 6801, e.g. 2026-03-01T00:00:00Z)
     #[arg(long)]
     end: String,
+
+    #[clap(flatten)]
+    payout_specifier: PayoutSpecifierArgs,
+}
+
+#[derive(Debug, clap::Args)]
+#[group(required = true, multiple = false)]
+pub struct PayoutSpecifierArgs {
+    /// Pays out helpers at a fixed rate of X cookies per ticket
+    #[clap(long)]
+    cookie_rate: Option<f64>,
+    /// Pays out helpers based on a cookie pool of X cookies, distributed proportionally to the number of tickets closed
+    #[clap(long)]
+    cookie_pool: Option<i32>,
 }
 
 fn parse_datetime(s: &str) -> Result<OffsetDateTime> {
@@ -73,10 +87,78 @@ fn main() -> anyhow::Result<()> {
         Client::connect(&db_url, NoTls).context("Failed to connect to Nephthys database")?;
 
     let helper_tickets = get_helper_leaderboard(client, start, end)?;
+
+    if let Some(payout_rate) = command_args.payout_specifier.cookie_rate {
+        do_static_rate_payouts(
+            helper_tickets,
+            payout_rate,
+            flavortown_api,
+            flavortown_api_key,
+        )
+    } else if let Some(pool) = command_args.payout_specifier.cookie_pool {
+        do_pool_payouts(helper_tickets, pool, flavortown_api, flavortown_api_key)
+    } else {
+        unreachable!("One of cookie_rate or cookie_pool should be set")
+    }
+}
+
+fn do_pool_payouts(
+    helper_tickets: HashMap<String, i64>,
+    pool: i32,
+    flavortown_api: Url,
+    flavortown_api_key: String,
+) -> Result<(), anyhow::Error> {
+    let total_tickets_closed: i64 = helper_tickets.values().sum();
     let helper_cookies: HashMap<&String, f64> = helper_tickets
         .iter()
-        .map(|(id, tickets)| (id, (*tickets as f64) * 0.5))
+        .map(|(id, tickets)| {
+            let payout = (*tickets as f64 / total_tickets_closed as f64) * pool as f64;
+            (id, payout)
+        })
         .collect();
+    print_helper_cookies(
+        helper_cookies,
+        &helper_tickets,
+        flavortown_api,
+        flavortown_api_key,
+    )?;
+    Ok(())
+}
+
+fn do_static_rate_payouts(
+    helper_tickets: HashMap<String, i64>,
+    payout_rate: f64,
+    flavortown_api: Url,
+    flavortown_api_key: String,
+) -> Result<(), anyhow::Error> {
+    let helper_cookies: HashMap<&String, f64> = helper_tickets
+        .iter()
+        .map(|(id, tickets)| (id, (*tickets as f64) * payout_rate))
+        .collect();
+    print_helper_cookies(
+        helper_cookies,
+        &helper_tickets,
+        flavortown_api,
+        flavortown_api_key,
+    )?;
+    Ok(())
+}
+
+fn print_helper_cookies(
+    helper_cookies: HashMap<&String, f64>,
+    helper_tickets: &HashMap<String, i64>,
+    flavortown_api: Url,
+    flavortown_api_key: String,
+) -> Result<(), anyhow::Error> {
+    println!(
+        "Total tickets closed: {}",
+        helper_tickets.values().sum::<i64>()
+    );
+    println!(
+        "Total cookies to pay out: {}",
+        helper_cookies.values().sum::<f64>()
+    );
+    println!();
 
     for (slack_id, cookies) in helper_cookies.iter() {
         let matching_users =
@@ -92,7 +174,6 @@ fn main() -> anyhow::Result<()> {
             helper_tickets.get(*slack_id).unwrap_or(&0)
         );
     }
-
     Ok(())
 }
 
