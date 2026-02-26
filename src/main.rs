@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Ok, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use postgres::{Client, NoTls};
 use reqwest::Url;
 use serde::Deserialize;
@@ -88,64 +88,52 @@ fn main() -> anyhow::Result<()> {
 
     let helper_tickets = get_helper_leaderboard(client, start, end)?;
 
-    if let Some(payout_rate) = command_args.payout_specifier.cookie_rate {
-        do_static_rate_payouts(
-            helper_tickets,
-            payout_rate,
-            flavortown_api,
-            flavortown_api_key,
-        )
+    let helper_cookies = if let Some(payout_rate) = command_args.payout_specifier.cookie_rate {
+        do_static_rate_payouts(&helper_tickets, payout_rate)?
     } else if let Some(pool) = command_args.payout_specifier.cookie_pool {
-        do_pool_payouts(helper_tickets, pool, flavortown_api, flavortown_api_key)
+        do_pool_payouts(&helper_tickets, pool)?
     } else {
         unreachable!("One of cookie_rate or cookie_pool should be set")
-    }
+    };
+
+    print_helper_cookies(
+        &helper_cookies,
+        &helper_tickets,
+        flavortown_api,
+        flavortown_api_key,
+    )?;
+
+    Ok(())
 }
 
 fn do_pool_payouts(
-    helper_tickets: HashMap<String, i64>,
+    helper_tickets: &HashMap<String, i64>,
     pool: i32,
-    flavortown_api: Url,
-    flavortown_api_key: String,
-) -> Result<(), anyhow::Error> {
+) -> Result<HashMap<String, f64>, anyhow::Error> {
     let total_tickets_closed: i64 = helper_tickets.values().sum();
-    let helper_cookies: HashMap<&String, f64> = helper_tickets
+    let helper_cookies: HashMap<String, f64> = helper_tickets
         .iter()
         .map(|(id, tickets)| {
             let payout = (*tickets as f64 / total_tickets_closed as f64) * pool as f64;
-            (id, payout)
+            (id.clone(), payout)
         })
         .collect();
-    print_helper_cookies(
-        helper_cookies,
-        &helper_tickets,
-        flavortown_api,
-        flavortown_api_key,
-    )?;
-    Ok(())
+    Ok(helper_cookies)
 }
 
 fn do_static_rate_payouts(
-    helper_tickets: HashMap<String, i64>,
+    helper_tickets: &HashMap<String, i64>,
     payout_rate: f64,
-    flavortown_api: Url,
-    flavortown_api_key: String,
-) -> Result<(), anyhow::Error> {
-    let helper_cookies: HashMap<&String, f64> = helper_tickets
+) -> Result<HashMap<String, f64>, anyhow::Error> {
+    let helper_cookies: HashMap<String, f64> = helper_tickets
         .iter()
-        .map(|(id, tickets)| (id, (*tickets as f64) * payout_rate))
+        .map(|(id, tickets)| (id.clone(), (*tickets as f64) * payout_rate))
         .collect();
-    print_helper_cookies(
-        helper_cookies,
-        &helper_tickets,
-        flavortown_api,
-        flavortown_api_key,
-    )?;
-    Ok(())
+    Ok(helper_cookies)
 }
 
 fn print_helper_cookies(
-    helper_cookies: HashMap<&String, f64>,
+    helper_cookies: &HashMap<String, f64>,
     helper_tickets: &HashMap<String, i64>,
     flavortown_api: Url,
     flavortown_api_key: String,
@@ -160,7 +148,7 @@ fn print_helper_cookies(
     );
     println!();
 
-    let mut helper_cookies_vec: Vec<(&&String, &f64)> = helper_cookies.iter().collect();
+    let mut helper_cookies_vec: Vec<(&String, &f64)> = helper_cookies.iter().collect();
     helper_cookies_vec.sort_by(|(_, cookies_a), (_, cookies_b)| {
         cookies_b
             .partial_cmp(cookies_a)
@@ -177,7 +165,7 @@ fn print_helper_cookies(
             user.display_name,
             format!("https://flavortown.hackclub.com/admin/users/{}", user.id),
             (*cookies as f32), // use f32 to reduce the chances of .0000000000001
-            helper_tickets.get(*slack_id).unwrap_or(&0)
+            helper_tickets.get(slack_id).unwrap_or(&0)
         );
     }
     Ok(())
