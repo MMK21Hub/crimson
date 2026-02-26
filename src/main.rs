@@ -31,6 +31,9 @@ struct PayoutArgs {
 
     #[clap(flatten)]
     payout_specifier: PayoutSpecifierArgs,
+
+    #[clap(long, value_enum)]
+    format: Option<PayoutListFormat>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -42,6 +45,18 @@ pub struct PayoutSpecifierArgs {
     /// Pays out helpers based on a cookie pool of X cookies, distributed proportionally to the number of tickets closed
     #[clap(long)]
     cookie_pool: Option<i32>,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum PayoutListFormat {
+    /// Format the payout list in a way that's optimised for letting a
+    /// Flavortown admin easily and accurately give the payouts manually
+    #[clap(name = "payout")]
+    ManualPayouts,
+    /// Format the payout list in a way that makes sense for a
+    /// Slack message
+    #[clap(name = "message")]
+    SlackMessage,
 }
 
 fn parse_datetime(s: &str) -> Result<OffsetDateTime> {
@@ -88,10 +103,10 @@ fn main() -> anyhow::Result<()> {
 
     let helper_tickets = get_helper_leaderboard(client, start, end)?;
 
-    let helper_cookies = if let Some(payout_rate) = command_args.payout_specifier.cookie_rate {
-        do_static_rate_payouts(&helper_tickets, payout_rate)?
-    } else if let Some(pool) = command_args.payout_specifier.cookie_pool {
-        do_pool_payouts(&helper_tickets, pool)?
+    let helper_cookies = if let Some(payout_rate) = &command_args.payout_specifier.cookie_rate {
+        do_static_rate_payouts(&helper_tickets, &payout_rate)?
+    } else if let Some(pool) = &command_args.payout_specifier.cookie_pool {
+        do_pool_payouts(&helper_tickets, &pool)?
     } else {
         unreachable!("One of cookie_rate or cookie_pool should be set")
     };
@@ -99,6 +114,10 @@ fn main() -> anyhow::Result<()> {
     print_helper_cookies(
         &helper_cookies,
         &helper_tickets,
+        &command_args
+            .clone()
+            .format
+            .unwrap_or(PayoutListFormat::ManualPayouts),
         flavortown_api,
         flavortown_api_key,
     )?;
@@ -108,8 +127,9 @@ fn main() -> anyhow::Result<()> {
 
 fn do_pool_payouts(
     helper_tickets: &HashMap<String, i64>,
-    pool: i32,
+    pool: &i32,
 ) -> Result<HashMap<String, f64>, anyhow::Error> {
+    let pool = pool.to_owned();
     let total_tickets_closed: i64 = helper_tickets.values().sum();
     let helper_cookies: HashMap<String, f64> = helper_tickets
         .iter()
@@ -123,7 +143,7 @@ fn do_pool_payouts(
 
 fn do_static_rate_payouts(
     helper_tickets: &HashMap<String, i64>,
-    payout_rate: f64,
+    payout_rate: &f64,
 ) -> Result<HashMap<String, f64>, anyhow::Error> {
     let helper_cookies: HashMap<String, f64> = helper_tickets
         .iter()
@@ -135,6 +155,7 @@ fn do_static_rate_payouts(
 fn print_helper_cookies(
     helper_cookies: &HashMap<String, f64>,
     helper_tickets: &HashMap<String, i64>,
+    format: &PayoutListFormat,
     flavortown_api: Url,
     flavortown_api_key: String,
 ) -> Result<(), anyhow::Error> {
@@ -160,13 +181,27 @@ fn print_helper_cookies(
         let user = matching_users
             .get(0)
             .context("Flavortown API returned no users")?;
-        println!(
-            "{}: {} gets {} cookies! ({} tkts)\n",
-            user.display_name,
-            format!("https://flavortown.hackclub.com/admin/users/{}", user.id),
-            (*cookies as f32), // use f32 to reduce the chances of .0000000000001
-            helper_tickets.get(slack_id).unwrap_or(&0)
-        );
+        match format {
+            PayoutListFormat::ManualPayouts => println!(
+                "{}: {} gets {} cookies! ({} tkts)\n",
+                user.display_name,
+                format!("https://flavortown.hackclub.com/admin/users/{}", user.id),
+                (*cookies as f32), // use f32 to reduce the chances of .0000000000001
+                match helper_tickets.get(slack_id) {
+                    Some(tickets) => tickets.to_string(),
+                    None => "[unknown]".to_string(),
+                },
+            ),
+            PayoutListFormat::SlackMessage => println!(
+                "- *{}* closed *{}* tickets, netting them *{}* cookies.",
+                user.display_name,
+                match helper_tickets.get(slack_id) {
+                    Some(tickets) => tickets.to_string(),
+                    None => "[unknown]".to_string(),
+                },
+                (*cookies).round()
+            ),
+        };
     }
     Ok(())
 }
