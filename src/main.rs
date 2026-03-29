@@ -64,7 +64,7 @@ pub struct BonusSpecifierArgs {
 
     /// A higher-than-default cookies/ticket value to use for bonus users
     #[clap(long)]
-    bonus_cookie_rate: Option<f64>,
+    bonus_rate: Option<f64>,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -142,7 +142,7 @@ fn main() -> anyhow::Result<()> {
             bonus: if let Some(bonus_users) = &command_args.bonus_users {
                 Some(BonusConfig {
                     users: bonus_users.clone(),
-                    bonus: if let Some(rate) = command_args.bonus_specifier.bonus_cookie_rate {
+                    bonus: if let Some(rate) = command_args.bonus_specifier.bonus_rate {
                         BonusConfigBonus::CookieRate(rate)
                     } else if let Some(cookies) = command_args.bonus_specifier.bonus_cookies {
                         BonusConfigBonus::ExtraCookies(cookies)
