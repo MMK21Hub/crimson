@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{Context, Ok, Result};
+use anyhow::{Context, Ok, Result, anyhow};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use postgres::{Client, NoTls};
 use reqwest::Url;
@@ -32,19 +32,18 @@ struct PayoutArgs {
     #[clap(flatten)]
     payout_specifier: PayoutSpecifierArgs,
 
-    /// Optional user(s) to give a bonus payout to.
+    /// Optional user(s) to give a "bonus payout" to
     #[arg(long, num_args = 0..)]
     bonus_users: Option<Vec<String>>,
 
     #[clap(flatten)]
     bonus_specifier: BonusSpecifierArgs,
 
-    // Specifies how the terminal output will be formatted.
+    // Specifies how the terminal output will be formatted
     #[clap(long, value_enum)]
     format: Option<PayoutListFormat>,
 }
 
-// Configures how we'll calculate payouts, and what the rates will be
 #[derive(Debug, clap::Args)]
 #[group(required = true, multiple = false)]
 pub struct PayoutSpecifierArgs {
@@ -56,16 +55,14 @@ pub struct PayoutSpecifierArgs {
     cookie_pool: Option<i32>,
 }
 
-/// Reward a subset of helpers with a bonus (e.g. increased multiplier, or a flat number of extra cookies)
 #[derive(Debug, clap::Args)]
 #[group(required = false, multiple = false)]
 pub struct BonusSpecifierArgs {
-    /// An extra number of cookies to give to users who deserve a bonus payout, on top of their normal payout.
+    /// Number of cookies to give to bonus users, on top of normal payout
     #[clap(long)]
     bonus_cookies: Option<f64>,
 
-    /// The cookies/ticket value to use for users who deserve a bonus payout.
-    /// For this to make any sense, it should be greater than `--cookie-rate`
+    /// A higher-than-default cookies/ticket value to use for bonus users
     #[clap(long)]
     bonus_cookie_rate: Option<f64>,
 }
@@ -80,6 +77,32 @@ enum PayoutListFormat {
     /// Slack message
     #[clap(name = "message")]
     SlackMessage,
+}
+
+/// Payout calculation configuration, parsed from cli args into a struct that's easier to work with.
+/// Configures how we'll calculate payouts, and what the rates will be.
+enum PayoutCalcConfig {
+    CookiesPerTicket {
+        cookie_rate: f64,
+        bonus: Option<BonusConfig>,
+    },
+    Pool {
+        pool: i32,
+    },
+}
+
+/// Reward a subset of helpers with a bonus (e.g. increased multiplier, or a flat number of extra cookies)
+struct BonusConfig {
+    users: Vec<String>,
+    bonus: BonusConfigBonus,
+}
+
+enum BonusConfigBonus {
+    /// An extra number of cookies to give to users who deserve a bonus payout, on top of their normal payout.
+    ExtraCookies(f64),
+    /// The cookies/ticket value to use for users who deserve a bonus payout.
+    /// For this to make any sense, it should be greater than `--cookie-rate`
+    CookieRate(f64),
 }
 
 fn parse_datetime(s: &str) -> Result<OffsetDateTime> {
@@ -124,15 +147,34 @@ fn main() -> anyhow::Result<()> {
     let client =
         Client::connect(&db_url, NoTls).context("Failed to connect to Nephthys database")?;
 
-    let helper_tickets = get_helper_leaderboard(client, start, end)?;
-
-    let helper_cookies = if let Some(payout_rate) = &command_args.payout_specifier.cookie_rate {
-        do_static_rate_payouts(&helper_tickets, &payout_rate)?
+    // Create payout config from command line args
+    let payout_config = if let Some(cookie_rate) = &command_args.payout_specifier.cookie_rate {
+        PayoutCalcConfig::CookiesPerTicket {
+            cookie_rate: *cookie_rate,
+            bonus: if let Some(bonus_users) = &command_args.bonus_users {
+                Some(BonusConfig {
+                    users: bonus_users.clone(),
+                    bonus: if let Some(rate) = command_args.bonus_specifier.bonus_cookie_rate {
+                        BonusConfigBonus::CookieRate(rate)
+                    } else if let Some(cookies) = command_args.bonus_specifier.bonus_cookies {
+                        BonusConfigBonus::ExtraCookies(cookies)
+                    } else {
+                        unreachable!("bonus_users specified without a valid bonus specifier")
+                    },
+                })
+            } else {
+                None // No bonus_users specified
+            },
+        }
     } else if let Some(pool) = &command_args.payout_specifier.cookie_pool {
-        do_pool_payouts(&helper_tickets, &pool)?
+        PayoutCalcConfig::Pool { pool: *pool }
     } else {
         unreachable!("One of cookie_rate or cookie_pool should be set")
     };
+
+    let helper_tickets = get_helper_leaderboard(client, start, end)?;
+
+    let helper_cookies = calculate_payouts(&helper_tickets, &payout_config)?;
 
     print_helper_cookies(
         &helper_cookies,
@@ -148,31 +190,55 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn do_pool_payouts(
+fn calculate_payouts(
     helper_tickets: &HashMap<String, i64>,
-    pool: &i32,
+    payout_config: &PayoutCalcConfig,
 ) -> Result<HashMap<String, f64>, anyhow::Error> {
-    let pool = pool.to_owned();
-    let total_tickets_closed: i64 = helper_tickets.values().sum();
-    let helper_cookies: HashMap<String, f64> = helper_tickets
-        .iter()
-        .map(|(id, tickets)| {
-            let payout = (*tickets as f64 / total_tickets_closed as f64) * pool as f64;
-            (id.clone(), payout)
-        })
-        .collect();
-    Ok(helper_cookies)
-}
-
-fn do_static_rate_payouts(
-    helper_tickets: &HashMap<String, i64>,
-    payout_rate: &f64,
-) -> Result<HashMap<String, f64>, anyhow::Error> {
-    let helper_cookies: HashMap<String, f64> = helper_tickets
-        .iter()
-        .map(|(id, tickets)| (id.clone(), (*tickets as f64) * payout_rate))
-        .collect();
-    Ok(helper_cookies)
+    match payout_config {
+        PayoutCalcConfig::Pool { pool } => {
+            let total_tickets_closed: i64 = helper_tickets.values().sum();
+            let helper_cookies: HashMap<String, f64> = helper_tickets
+                .iter()
+                .map(|(id, tickets)| {
+                    let payout = (*tickets as f64 / total_tickets_closed as f64) * (*pool as f64);
+                    (id.clone(), payout)
+                })
+                .collect();
+            Ok(helper_cookies)
+        }
+        PayoutCalcConfig::CookiesPerTicket {
+            cookie_rate: base_rate,
+            bonus,
+        } => match bonus {
+            Some(bonus_config) => {
+                let helper_cookies: HashMap<String, f64> = helper_tickets
+                    .iter()
+                    .map(|(id, tickets)| {
+                        let tickets = *tickets as f64;
+                        let payout = if bonus_config.users.contains(id) {
+                            match &bonus_config.bonus {
+                                BonusConfigBonus::ExtraCookies(extra) => {
+                                    (tickets * base_rate) + extra
+                                }
+                                BonusConfigBonus::CookieRate(bonus_rate) => tickets * bonus_rate,
+                            }
+                        } else {
+                            tickets * base_rate
+                        };
+                        (id.clone(), payout)
+                    })
+                    .collect();
+                Ok(helper_cookies)
+            }
+            None => {
+                let helper_cookies: HashMap<String, f64> = helper_tickets
+                    .iter()
+                    .map(|(id, tickets)| (id.clone(), (*tickets as f64) * base_rate))
+                    .collect();
+                Ok(helper_cookies)
+            }
+        },
+    }
 }
 
 fn print_helper_cookies(
@@ -229,6 +295,7 @@ fn print_helper_cookies(
     Ok(())
 }
 
+/// Returns a map of Slack IDs to tickets closed
 fn get_helper_leaderboard(
     mut client: Client,
     start: OffsetDateTime,
