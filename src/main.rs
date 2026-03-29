@@ -32,10 +32,19 @@ struct PayoutArgs {
     #[clap(flatten)]
     payout_specifier: PayoutSpecifierArgs,
 
+    /// Optional user(s) to give a bonus payout to.
+    #[arg(long, num_args = 0..)]
+    bonus_users: Option<Vec<String>>,
+
+    #[clap(flatten)]
+    bonus_specifier: BonusSpecifierArgs,
+
+    // Specifies how the terminal output will be formatted.
     #[clap(long, value_enum)]
     format: Option<PayoutListFormat>,
 }
 
+// Configures how we'll calculate payouts, and what the rates will be
 #[derive(Debug, clap::Args)]
 #[group(required = true, multiple = false)]
 pub struct PayoutSpecifierArgs {
@@ -45,6 +54,20 @@ pub struct PayoutSpecifierArgs {
     /// Pays out helpers based on a cookie pool of X cookies, distributed proportionally to the number of tickets closed
     #[clap(long)]
     cookie_pool: Option<i32>,
+}
+
+/// Reward a subset of helpers with a bonus (e.g. increased multiplier, or a flat number of extra cookies)
+#[derive(Debug, clap::Args)]
+#[group(required = false, multiple = false)]
+pub struct BonusSpecifierArgs {
+    /// An extra number of cookies to give to users who deserve a bonus payout, on top of their normal payout.
+    #[clap(long)]
+    bonus_cookies: Option<f64>,
+
+    /// The cookies/ticket value to use for users who deserve a bonus payout.
+    /// For this to make any sense, it should be greater than `--cookie-rate`
+    #[clap(long)]
+    bonus_cookie_rate: Option<f64>,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
