@@ -134,18 +134,6 @@ fn main() -> anyhow::Result<()> {
     };
     let start = parse_datetime(&command_args.start)?;
     let end = parse_datetime(&command_args.end)?;
-    let pretty_printer = format_description!(
-        "[weekday] [day padding:none] [month repr:short] [year] (@ [hour]:[minute])"
-    );
-    println!(
-        "Selecting leaderboard from {} to {} (Period: {})",
-        start.format(&pretty_printer)?,
-        end.format(&pretty_printer)?,
-        end - start
-    );
-
-    let client =
-        Client::connect(&db_url, NoTls).context("Failed to connect to Nephthys database")?;
 
     // Create payout config from command line args
     let payout_config = if let Some(cookie_rate) = &command_args.payout_specifier.cookie_rate {
@@ -171,6 +159,28 @@ fn main() -> anyhow::Result<()> {
     } else {
         unreachable!("One of cookie_rate or cookie_pool should be set")
     };
+
+    let pretty_printer = format_description!(
+        "[weekday] [day padding:none] [month repr:short] [year] (@ [hour]:[minute])"
+    );
+    println!(
+        "Selecting leaderboard from {} to {} (Period: {})",
+        start.format(&pretty_printer)?,
+        end.format(&pretty_printer)?,
+        end - start
+    );
+    if let Some(bonus_users) = &command_args.bonus_users {
+        println!(
+            "Giving bonus payouts to {} user(s): {}",
+            bonus_users.len(),
+            bonus_users.join(", ")
+        );
+    } else {
+        println!("No bonus payouts");
+    }
+
+    let client =
+        Client::connect(&db_url, NoTls).context("Failed to connect to Nephthys database")?;
 
     let helper_tickets = get_helper_leaderboard(client, start, end)?;
 
