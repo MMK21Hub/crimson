@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 
-use anyhow::{Context, Ok, Result, anyhow};
+use anyhow::{Context, Ok, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use postgres::{Client, NoTls};
 use reqwest::Url;
@@ -39,7 +40,13 @@ struct PayoutArgs {
     #[clap(flatten)]
     bonus_specifier: BonusSpecifierArgs,
 
-    // Specifies how the terminal output will be formatted
+    /// How many additional tickets must be resolved before a payout is increased
+    ///
+    /// E.g. with a quantum of 10, the payout for 10 ticket and 19 tickets will be the same.
+    #[arg(long, default_value_t = NonZeroU64::MIN)]
+    ticket_quantum: NonZeroU64,
+
+    /// Specify how the terminal output will be formatted
     #[clap(long, value_enum)]
     format: Option<PayoutListFormat>,
 }
@@ -69,12 +76,11 @@ pub struct BonusSpecifierArgs {
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
 enum PayoutListFormat {
-    /// Format the payout list in a way that's optimised for letting a
+    /// Format that's optimised for letting a
     /// Flavortown admin easily and accurately give the payouts manually
     #[clap(name = "payout")]
     ManualPayouts,
-    /// Format the payout list in a way that makes sense for a
-    /// Slack message
+    /// Format that makes sense for a Slack message
     #[clap(name = "message")]
     SlackMessage,
 }
@@ -84,6 +90,7 @@ enum PayoutListFormat {
 enum PayoutCalcConfig {
     CookiesPerTicket {
         cookie_rate: f64,
+        quantum: NonZeroU64,
         bonus: Option<BonusConfig>,
     },
     Pool {
@@ -139,6 +146,7 @@ fn main() -> anyhow::Result<()> {
     let payout_config = if let Some(cookie_rate) = &command_args.payout_specifier.cookie_rate {
         PayoutCalcConfig::CookiesPerTicket {
             cookie_rate: *cookie_rate,
+            quantum: command_args.ticket_quantum,
             bonus: if let Some(bonus_users) = &command_args.bonus_users {
                 Some(BonusConfig {
                     users: bonus_users.clone(),
@@ -219,21 +227,25 @@ fn calculate_payouts(
         PayoutCalcConfig::CookiesPerTicket {
             cookie_rate: base_rate,
             bonus,
+            quantum,
         } => match bonus {
             Some(bonus_config) => {
                 let helper_cookies: HashMap<String, f64> = helper_tickets
                     .iter()
                     .map(|(id, tickets)| {
-                        let tickets = *tickets as f64;
+                        let tickets: u64 = (*tickets).try_into().unwrap(); // FIXME
+                        let rounded_tickets = (tickets - (tickets % quantum.get())) as f64;
                         let payout = if bonus_config.users.contains(id) {
                             match &bonus_config.bonus {
                                 BonusConfigBonus::ExtraCookies(extra) => {
-                                    (tickets * base_rate) + extra
+                                    (rounded_tickets * base_rate) + extra
                                 }
-                                BonusConfigBonus::CookieRate(bonus_rate) => tickets * bonus_rate,
+                                BonusConfigBonus::CookieRate(bonus_rate) => {
+                                    rounded_tickets * bonus_rate
+                                }
                             }
                         } else {
-                            tickets * base_rate
+                            rounded_tickets * base_rate
                         };
                         (id.clone(), payout)
                     })
