@@ -1,0 +1,3 @@
+- Prefers configurable paths (e.g., database location) exposed as CLI flags with sensible defaults rather than environment variables. Confidence: 0.7
+- Expects parent directories to be created automatically when a referenced file path doesn't exist (e.g., `create_dir_all` before opening a database file). Confidence: 0.7
+- Prefers race-condition-safe code: avoids check-then-act (e.g., `exists()` before creating) in favor of idempotent atomic operations like `create_dir_all`. Confidence: 0.6
