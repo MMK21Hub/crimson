@@ -1,6 +1,6 @@
 # Crimson
 
-A Rust tool to calculate cookie payouts for the [Flavortown](https://flavortown.hackclub.com/) support team.
+A Rust tool to calculate stardust payouts for the [Stardance](https://stardance.hackclub.com/) Support Scouts.
 
 Named _Crimson_ because we want to avoid any _Corruption_ when giving payouts.
 
