@@ -21,3 +21,9 @@ Run it, e.g.
 ```bash
 cargo run payout --start "2026-02-02T20:00Z" --end "2026-02-06T00:00Z"
 ```
+
+## Credits
+
+Made with <3 by Mish for [Hack Club](https://hackclub.com/).
+
+Open-source under the [MIT License](LICENSE).

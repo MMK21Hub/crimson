@@ -2,6 +2,8 @@
 name = "crimson"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+authors = ["Mish <mish@hackclub.com>"]
 
 [dependencies]
 anyhow = "1.0.101"
