@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
-use anyhow::{Context, Ok, Result};
+use anyhow::{Context, Ok, Result, anyhow};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use postgres::{Client, NoTls};
+use reqwest::Url;
+use serde::Deserialize;
 use time::OffsetDateTime;
 use time::macros::format_description;
 
@@ -80,7 +82,7 @@ enum PayoutListFormat {
 /// Payout calculation configuration, parsed from cli args into a struct that's easier to work with.
 /// Configures how we'll calculate payouts, and what the rates will be.
 enum PayoutCalcConfig {
-    stardustPerTicket {
+    StardustPerTicket {
         stardust_rate: f64,
         bonus: Option<BonusConfig>,
     },
@@ -97,10 +99,10 @@ struct BonusConfig {
 
 enum BonusConfigBonus {
     /// An extra number of stardust to give to users who deserve a bonus payout, on top of their normal payout.
-    Extrastardust(f64),
+    ExtraStardust(f64),
     /// The stardust/ticket value to use for users who deserve a bonus payout.
     /// For this to make any sense, it should be greater than `--stardust-rate`
-    stardustRate(f64),
+    StardustRate(f64),
 }
 
 fn parse_datetime(s: &str) -> Result<OffsetDateTime> {
@@ -124,15 +126,15 @@ fn main() -> anyhow::Result<()> {
 
     // Create payout config from command line args
     let payout_config = if let Some(stardust_rate) = &command_args.payout_specifier.stardust_rate {
-        PayoutCalcConfig::stardustPerTicket {
+        PayoutCalcConfig::StardustPerTicket {
             stardust_rate: *stardust_rate,
             bonus: if let Some(bonus_users) = &command_args.bonus_users {
                 Some(BonusConfig {
                     users: bonus_users.clone(),
                     bonus: if let Some(rate) = command_args.bonus_specifier.bonus_rate {
-                        BonusConfigBonus::stardustRate(rate)
+                        BonusConfigBonus::StardustRate(rate)
                     } else if let Some(stardust) = command_args.bonus_specifier.bonus_stardust {
-                        BonusConfigBonus::Extrastardust(stardust)
+                        BonusConfigBonus::ExtraStardust(stardust)
                     } else {
                         unreachable!("bonus_users specified without a valid bonus specifier")
                     },
@@ -201,7 +203,7 @@ fn calculate_payouts(
                 .collect();
             Ok(helper_stardust)
         }
-        PayoutCalcConfig::stardustPerTicket {
+        PayoutCalcConfig::StardustPerTicket {
             stardust_rate: base_rate,
             bonus,
         } => match bonus {
@@ -212,10 +214,10 @@ fn calculate_payouts(
                         let tickets = *tickets as f64;
                         let payout = if bonus_config.users.contains(id) {
                             match &bonus_config.bonus {
-                                BonusConfigBonus::Extrastardust(extra) => {
+                                BonusConfigBonus::ExtraStardust(extra) => {
                                     (tickets * base_rate) + extra
                                 }
-                                BonusConfigBonus::stardustRate(bonus_rate) => tickets * bonus_rate,
+                                BonusConfigBonus::StardustRate(bonus_rate) => tickets * bonus_rate,
                             }
                         } else {
                             tickets * base_rate
