@@ -16,7 +16,7 @@ DATABASE_URL="postgresql://username:password@coolify/nephthys"
 Run it, e.g.
 
 ```bash
-cargo run payout --start "2026-02-02T20:00Z" --end "2026-02-06T00:00Z"
+cargo run payout --start "2026-02-02T20:00Z" --end "2026-02-06T00:00Z" --stardust-rate 0.5
 ```
 
 ## Credits
