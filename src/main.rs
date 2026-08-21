@@ -115,19 +115,8 @@ fn parse_datetime(s: &str) -> Result<OffsetDateTime> {
 fn main() -> anyhow::Result<()> {
     // Configuration
     dotenvy::dotenv().ok();
-    let db_url =
-        std::env::var("DATABASE_URL").context("DATABASE_URL environment variable not set")?;
-    let flavortown_api = std::env::var("FLAVORTOWN_API_BASE")
-        .context("FLAVORTOWN_API_BASE environment variable not set")?;
-    let flavortown_api =
-        Url::parse(&flavortown_api).context("FLAVORTOWN_API_BASE is not a valid URL")?;
-    if flavortown_api.path().trim_end_matches("/") != "/api/v1" {
-        println!(
-            "Warning: FLAVORTOWN_API_BASE does not end in `/api/v1`. Are you sure you have the full URL?"
-        );
-    }
-    let flavortown_api_key = std::env::var("FLAVORTOWN_API_KEY")
-        .context("FLAVORTOWN_API_KEY environment variable not set")?;
+    let nephthys_db_url =
+        std::env::var("NEPHTHYS_DB_URL").context("NEPHTHYS_DB_URL environment variable not set")?;
     let args = CrimsonArgs::parse();
     let command_args: &PayoutArgs = match &args.command {
         Command::Payout(p) => p,
@@ -179,10 +168,10 @@ fn main() -> anyhow::Result<()> {
         println!("No bonus payouts");
     }
 
-    let client =
-        Client::connect(&db_url, NoTls).context("Failed to connect to Nephthys database")?;
+    let nephthys_db = Client::connect(&nephthys_db_url, NoTls)
+        .context("Failed to connect to Nephthys database")?;
 
-    let helper_tickets = get_helper_leaderboard(client, start, end)?;
+    let helper_tickets = get_helper_leaderboard(nephthys_db, start, end)?;
 
     let helper_cookies = calculate_payouts(&helper_tickets, &payout_config)?;
 
@@ -193,8 +182,6 @@ fn main() -> anyhow::Result<()> {
             .clone()
             .format
             .unwrap_or(PayoutListFormat::ManualPayouts),
-        flavortown_api,
-        flavortown_api_key,
     )?;
 
     Ok(())
@@ -255,8 +242,6 @@ fn print_helper_cookies(
     helper_cookies: &HashMap<String, f64>,
     helper_tickets: &HashMap<String, i64>,
     format: &PayoutListFormat,
-    flavortown_api: Url,
-    flavortown_api_key: String,
 ) -> Result<(), anyhow::Error> {
     println!(
         "Total tickets closed: {}",
@@ -275,16 +260,10 @@ fn print_helper_cookies(
             .expect("unexpected unorderable float")
     });
     for (slack_id, cookies) in helper_cookies_vec {
-        let matching_users =
-            get_flavortown_users(&flavortown_api, &flavortown_api_key, slack_id)?.users;
-        let user = matching_users
-            .get(0)
-            .context("Flavortown API returned no users")?;
         match format {
             PayoutListFormat::ManualPayouts => println!(
-                "{}: {} gets {} cookies! ({} tkts)\n",
-                user.display_name,
-                format!("https://flavortown.hackclub.com/admin/users/{}", user.id),
+                "{} gets {} cookies! ({} tkts)\n",
+                slack_id,
                 (*cookies as f32), // use f32 to reduce the chances of .0000000000001
                 match helper_tickets.get(slack_id) {
                     Some(tickets) => tickets.to_string(),
@@ -293,7 +272,7 @@ fn print_helper_cookies(
             ),
             PayoutListFormat::SlackMessage => println!(
                 "- *{}* closed *{}* tickets, netting them *{}* cookies.",
-                user.display_name,
+                slack_id,
                 match helper_tickets.get(slack_id) {
                     Some(tickets) => tickets.to_string(),
                     None => "[unknown]".to_string(),
@@ -338,46 +317,4 @@ fn get_helper_leaderboard(
         .collect();
 
     return Ok(hashmap);
-}
-
-#[derive(Deserialize, Debug)]
-#[allow(dead_code)]
-struct FlavortownUser {
-    id: i64,
-    slack_id: String,
-    display_name: String,
-    avatar: String,
-    project_ids: Vec<i64>,
-    cookies: Option<i64>,
-}
-#[derive(Deserialize, Debug)]
-struct FlavortownUsersResponse {
-    users: Vec<FlavortownUser>,
-}
-
-fn get_flavortown_users(
-    flavortown_api: &Url,
-    flavortown_api_key: &str,
-    query: &str,
-) -> Result<FlavortownUsersResponse, anyhow::Error> {
-    let client = reqwest::blocking::Client::new();
-    let mut url = flavortown_api.join("users")?;
-    url.query_pairs_mut().append_pair("query", query);
-    let response = client
-        .get(url)
-        .header("Authorization", format!("Bearer {}", flavortown_api_key))
-        .send()
-        .context("Failed to fetch users from Flavortown API")?;
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Flavortown API returned error: {} - {}",
-            response.status(),
-            response.text().unwrap_or_default()
-        ));
-    }
-    let data: FlavortownUsersResponse = response
-        .json()
-        .context("Invalid users response from Flavortown API")?;
-
-    Ok(data)
 }

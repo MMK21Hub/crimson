@@ -11,9 +11,6 @@ Fill out `.env` file:
 ```env
 # Nephthys database details
 DATABASE_URL="postgresql://username:password@coolify/nephthys"
-# Flavortown API details (read-only access for now)
-FLAVORTOWN_API_BASE="https://flavortown.hackclub.com"
-FLAVORTOWN_API_KEY="ft_sk_aaaaaaaaaaaaaaa"
 ```
 
 Run it, e.g.
