@@ -1,2 +1,5 @@
 /target
 .env
+
+/data
+/src/main.rs.old
