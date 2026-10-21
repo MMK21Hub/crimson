@@ -11,7 +11,7 @@ use reqwest::Url;
 use rusqlite::Connection;
 use serde::Deserialize;
 use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
+use time::format_description::well_known::{Iso8601, Rfc3339, iso8601};
 
 #[derive(Parser)]
 struct CrimsonArgs {
@@ -107,14 +107,6 @@ enum SessionRun {
     Resume(Session),
 }
 
-struct Payout {
-    user: User,
-    tickets: i64,
-    amount: i64,
-    unrounded_amount: f64,
-    justification: String,
-}
-
 #[derive(Deserialize)]
 struct StardanceUser {
     id: i64,
@@ -200,12 +192,23 @@ fn payout_reason(
     session_id: i64,
     memo: Option<&str>,
 ) -> String {
+    const ISO_TIME_FORMAT: iso8601::Config =
+        iso8601::Config::DEFAULT.set_time_precision(iso8601::TimePrecision::Second {
+            decimal_digits: None,
+        });
+
+    let iso_time_format = Iso8601::<{ ISO_TIME_FORMAT.encode() }>;
+
     match memo {
         Some(memo) => format!(
             "Support Scouts payout for {} start={} end={} tkts={tickets} session={session_id}",
             memo,
-            period_start.to_string(),
+            period_start
+                .format(&iso_time_format)
+                .unwrap_or_else(|_| format_time(period_start)),
             period_end
+                .format(&iso_time_format)
+                .unwrap_or_else(|_| format_time(period_end))
         ),
         None => format!(
             "Support Scouts payout from {} to {} tkts={tickets} session={session_id}",
@@ -449,31 +452,188 @@ fn run_payout(
         total_tickets
     ));
 
-    if !args.execute {
-        dry_run(&db, &ticket_counts, rate)?;
-        log("dry run complete: no Stardance API calls or database writes were performed");
-        return Ok(());
+    let users_by_slack = if args.execute {
+        sync_helpers_from_nephthys(
+            nephthys_db,
+            &db,
+            stardance_api,
+            stardance_api_key,
+            &ticket_counts,
+        )?
+    } else {
+        load_local_users(&db)?
+    };
+
+    let session = if args.execute {
+        Some(open_session(
+            &db,
+            resume,
+            kind,
+            period_start,
+            period_end,
+            rate,
+            memo.as_deref(),
+        )?)
+    } else {
+        None
+    };
+
+    let mut sorted: Vec<(&String, &i64)> = ticket_counts.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut paid_count = 0usize;
+    let mut paid_stardust = 0i64;
+    let mut planned_count = 0usize;
+    let mut planned_stardust = 0i64;
+
+    for (slack_id, tickets) in sorted {
+        let user = match users_by_slack.get(slack_id) {
+            Some(user) => user,
+            None if args.execute => {
+                return Err(anyhow!("no local user record found for helper {slack_id}"));
+            }
+            None => {
+                log(format!(
+                    "{slack_id}: {tickets} tickets - Stardance ID unknown; would be resolved during --execute"
+                ));
+                continue;
+            }
+        };
+
+        if user.excluded {
+            log(format!(
+                "{slack_id}: excluded from payouts ({tickets} tickets ignored)"
+            ));
+            continue;
+        }
+
+        let amount = round_stardust(*tickets, rate)?;
+        let unrounded = *tickets as f64 * rate;
+        if amount == 0 {
+            log(format!(
+                "{slack_id}: {tickets} tickets * {rate} = {unrounded:.2} -> 0 stardust (skipped)"
+            ));
+            // Log for debugging payout memos
+            // log(payout_reason(
+            //     period_start,
+            //     period_end,
+            //     *tickets,
+            //     52,
+            //     memo.as_deref(),
+            // ));
+            continue;
+        }
+
+        planned_count += 1;
+        planned_stardust += amount;
+
+        let Some(session) = &session else {
+            log(format!(
+                "{slack_id} (Stardance #{}): {tickets} tickets * {rate} = {unrounded:.2} -> {amount} stardust (dry run)",
+                user.stardance_id
+            ));
+            continue;
+        };
+
+        let user_id = i64::try_from(user.id)
+            .context("local user ID does not fit in a signed 64-bit integer")?;
+
+        let reason = payout_reason(
+            period_start,
+            period_end,
+            *tickets,
+            session.id,
+            memo.as_deref(),
+        );
+
+        if session.paid_users.contains(&user_id) {
+            log(format!(
+                "{slack_id} (Stardance #{}) already paid in session {}, skipping",
+                user.stardance_id, session.id
+            ));
+            continue;
+        }
+
+        post_balance_adjustment(
+            stardance_api,
+            stardance_api_key,
+            user.stardance_id,
+            amount,
+            &reason,
+        )
+        .with_context(|| {
+            format!(
+                "failed to pay {slack_id} (Stardance #{}): {reason}",
+                user.stardance_id
+            )
+        })?;
+
+        db.execute(
+            "INSERT INTO payout_transaction (session, user, amount, unrounded_amount, justification) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                session.id,
+                user_id,
+                amount,
+                unrounded,
+                justification(*tickets, rate)
+            ],
+        )
+        .with_context(|| format!("failed to record payout for {slack_id}"))?;
+
+        log(format!(
+            "paid {slack_id} (Stardance #{}) {amount} stardust: {reason}",
+            user.stardance_id
+        ));
+        paid_count += 1;
+        paid_stardust += amount;
     }
 
-    let users_by_slack = sync_helpers_from_nephthys(
-        nephthys_db,
-        &db,
-        stardance_api,
-        stardance_api_key,
-        &ticket_counts,
-    )?;
+    if let Some(session) = &session {
+        db.execute(
+            "UPDATE payout_session SET completed_at = ?1 WHERE id = ?2",
+            rusqlite::params![format_time(OffsetDateTime::now_utc()), session.id],
+        )
+        .context("failed to mark payout session as complete")?;
 
-    let payouts = build_payouts(&ticket_counts, &users_by_slack, rate)?;
+        log(format!(
+            "completed payout session {}: {paid_count} payouts, {paid_stardust} stardust",
+            session.id
+        ));
+    } else {
+        log(format!(
+            "dry run complete: {planned_count} payouts, {planned_stardust} stardust would be paid; no Stardance API calls or database writes were performed"
+        ));
+    }
 
-    let (session_id, paid_users) = match resume {
+    Ok(())
+}
+
+struct OpenSession {
+    id: i64,
+    paid_users: HashSet<i64>,
+}
+
+fn open_session(
+    db: &Connection,
+    resume: Option<Session>,
+    kind: SessionType,
+    period_start: OffsetDateTime,
+    period_end: OffsetDateTime,
+    rate: f64,
+    memo: Option<&str>,
+) -> anyhow::Result<OpenSession> {
+    match resume {
         Some(session) => {
-            let paid = load_paid_user_ids(&db, session.id)?;
+            let paid_users = load_paid_user_ids(db, session.id)?;
             log(format!(
                 "session {} already has {} recorded payouts",
                 session.id,
-                paid.len()
+                paid_users.len()
             ));
-            (session.id, paid)
+            Ok(OpenSession {
+                id: session.id,
+                paid_users,
+            })
         }
         None => {
             db.execute(
@@ -484,172 +644,18 @@ fn run_payout(
                     format_time(period_end),
                     rate,
                     format_time(OffsetDateTime::now_utc()),
-                    memo.as_deref()
+                    memo
                 ],
             )
             .context("failed to create payout session")?;
             let id = db.last_insert_rowid();
             log(format!("created {} payout session {id}", kind.as_str()));
-            (id, HashSet::new())
-        }
-    };
-
-    let mut paid_count = 0usize;
-    let mut paid_stardust = 0i64;
-    for payout in &payouts {
-        let user_id = i64::try_from(payout.user.id)
-            .context("local user ID does not fit in a signed 64-bit integer")?;
-
-        if paid_users.contains(&user_id) {
-            log(format!(
-                "{} (Stardance #{}) already paid in session {session_id}, skipping",
-                payout.user.slack_id, payout.user.stardance_id
-            ));
-            continue;
-        }
-
-        let reason = payout_reason(
-            period_start,
-            period_end,
-            payout.tickets,
-            session_id,
-            memo.as_deref(),
-        );
-        log(&reason);
-
-        post_balance_adjustment(
-            stardance_api,
-            stardance_api_key,
-            payout.user.stardance_id,
-            payout.amount,
-            &reason,
-        )
-        .with_context(|| {
-            format!(
-                "failed to pay {} (Stardance #{}): {reason}",
-                payout.user.slack_id, payout.user.stardance_id
-            )
-        })?;
-
-        db.execute(
-            "INSERT INTO payout_transaction (session, user, amount, unrounded_amount, justification) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                session_id,
-                user_id,
-                payout.amount,
-                payout.unrounded_amount,
-                payout.justification
-            ],
-        )
-        .with_context(|| format!("failed to record payout for {}", payout.user.slack_id))?;
-
-        log(format!(
-            "paid {} (Stardance #{}) {} stardust: {reason}",
-            payout.user.slack_id, payout.user.stardance_id, payout.amount
-        ));
-        paid_count += 1;
-        paid_stardust += payout.amount;
-    }
-
-    db.execute(
-        "UPDATE payout_session SET completed_at = ?1 WHERE id = ?2",
-        rusqlite::params![format_time(OffsetDateTime::now_utc()), session_id],
-    )
-    .context("failed to mark payout session as complete")?;
-
-    log(format!(
-        "completed payout session {session_id}: {paid_count} payouts, {paid_stardust} stardust"
-    ));
-
-    Ok(())
-}
-
-fn dry_run(db: &Connection, ticket_counts: &HashMap<String, i64>, rate: f64) -> anyhow::Result<()> {
-    let users = load_local_users(db)?;
-    let mut sorted: Vec<(&String, &i64)> = ticket_counts.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(b.0));
-
-    let mut resolved = 0usize;
-    let mut unknown_users = 0usize;
-    let mut excluded = 0usize;
-    let mut total_stardust = 0i64;
-
-    for (slack_id, tickets) in sorted {
-        match users.get(slack_id) {
-            Some(user) => {
-                if user.excluded {
-                    excluded += 1;
-                    log(format!(
-                        "{slack_id}: excluded from payouts ({tickets} tickets ignored)"
-                    ));
-                    continue;
-                }
-                resolved += 1;
-                let amount = round_stardust(*tickets, rate)?;
-                let unrounded = format!("{:.2}", *tickets as f64 * rate);
-                if amount == 0 {
-                    log(format!(
-                        "{slack_id}: {tickets} tickets * {rate} = {unrounded} -> 0 stardust (skipped)"
-                    ));
-                } else {
-                    log(format!(
-                        "{slack_id} (Stardance #{}): {tickets} tickets * {rate} = {unrounded} -> {amount} stardust",
-                        user.stardance_id
-                    ));
-                    total_stardust += amount;
-                }
-            }
-            None => {
-                unknown_users += 1;
-                log(format!(
-                    "{slack_id}: {tickets} tickets - Stardance ID unknown; would be resolved during --execute"
-                ));
-            }
+            Ok(OpenSession {
+                id,
+                paid_users: HashSet::new(),
+            })
         }
     }
-
-    log(format!(
-        "dry run summary: {resolved} helpers with known Stardance IDs, {unknown_users} unknown users, {excluded} excluded, {total_stardust} stardust would be paid"
-    ));
-
-    Ok(())
-}
-
-fn build_payouts(
-    ticket_counts: &HashMap<String, i64>,
-    users: &HashMap<String, User>,
-    rate: f64,
-) -> anyhow::Result<Vec<Payout>> {
-    let mut sorted: Vec<(&String, &i64)> = ticket_counts.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(b.0));
-
-    let mut payouts = Vec::with_capacity(sorted.len());
-    for (slack_id, tickets) in sorted {
-        let user = users
-            .get(slack_id)
-            .ok_or_else(|| anyhow!("no local user record found for helper {slack_id}"))?
-            .clone();
-        if user.excluded {
-            log(format!("skipping {slack_id}: excluded from payouts"));
-            continue;
-        }
-        let amount = round_stardust(*tickets, rate)?;
-        if amount == 0 {
-            log(format!(
-                "skipping {slack_id}: {tickets} tickets at {rate} sd/tkt rounds to 0 stardust"
-            ));
-            continue;
-        }
-        payouts.push(Payout {
-            user,
-            tickets: *tickets,
-            amount,
-            unrounded_amount: *tickets as f64 * rate,
-            justification: justification(*tickets, rate),
-        });
-    }
-
-    Ok(payouts)
 }
 
 fn load_local_users(db: &Connection) -> anyhow::Result<HashMap<String, User>> {
@@ -1086,23 +1092,8 @@ mod tests {
         );
         assert_eq!(
             payout_reason(start, end, 52, 1, Some("Tuesday lock-in huddle")),
-            "Support Scouts payout from 16 Sep 2026 to 10 Oct 2026 tkts=52 session=1 \"Tuesday lock-in huddle\""
+            "Support Scouts payout for Tuesday lock-in huddle start=2026-09-16T00:00:00Z end=2026-10-10T00:00:00Z tkts=52 session=1"
         );
-    }
-
-    #[test]
-    fn skips_excluded_users() {
-        let user = User {
-            id: 1,
-            stardance_id: 158,
-            slack_id: "U073M5L9U13".to_string(),
-            excluded: true,
-        };
-        let users = HashMap::from([("U073M5L9U13".to_string(), user)]);
-        let tickets = HashMap::from([("U073M5L9U13".to_string(), 25)]);
-
-        let payouts = build_payouts(&tickets, &users, 0.4).expect("build payouts");
-        assert!(payouts.is_empty());
     }
 
     #[test]
