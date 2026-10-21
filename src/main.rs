@@ -182,6 +182,8 @@ fn main() -> anyhow::Result<()> {
             .clone()
             .format
             .unwrap_or(PayoutListFormat::ManualPayouts),
+        start,
+        end,
     )?;
 
     Ok(())
@@ -242,6 +244,8 @@ fn print_helper_stardust(
     helper_stardust: &HashMap<String, f64>,
     helper_tickets: &HashMap<String, i64>,
     format: &PayoutListFormat,
+    start: OffsetDateTime,
+    end: OffsetDateTime,
 ) -> Result<(), anyhow::Error> {
     println!(
         "Total tickets closed: {}",
@@ -261,15 +265,26 @@ fn print_helper_stardust(
     });
     for (slack_id, stardust) in helper_stardust_vec {
         match format {
-            PayoutListFormat::ManualPayouts => println!(
-                "{} gets {} stardust! ({} tkts)\n",
-                slack_id,
-                (*stardust as f32), // use f32 to reduce the chances of .0000000000001
-                match helper_tickets.get(slack_id) {
+            PayoutListFormat::ManualPayouts => {
+                let tkts = match helper_tickets.get(slack_id) {
                     Some(tickets) => tickets.to_string(),
                     None => "[unknown]".to_string(),
-                },
-            ),
+                };
+                let date_formatter =
+                    format_description!("[day padding:none] [month repr:short] [year]");
+                println!(
+                    "https://stardance.hackclub.com/admin/users/{} gets {} stardust!",
+                    slack_id,
+                    (*stardust as f32), // use f32 to reduce the chances of .0000000000001
+                );
+                println!(
+                    "Support Scouts payout from {} to {} ({} tkts)",
+                    start.format(&date_formatter).unwrap_or_default(),
+                    end.format(&date_formatter).unwrap_or_default(),
+                    tkts
+                );
+                println!();
+            }
             PayoutListFormat::SlackMessage => println!(
                 "- *{}* closed *{}* tickets, netting them *{}* stardust.",
                 slack_id,
