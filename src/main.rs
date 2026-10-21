@@ -30,11 +30,11 @@ enum Command {
 
 #[derive(Args)]
 struct PayoutArgs {
-    /// Start time (ISO 8601, e.g. 2026-02-01T00:00:00Z). Required on the first run.
+    /// Start time (ISO 8601, e.g. 2026-02-01T00:00:00Z). Required on the first regular run and for bonus payouts.
     #[arg(long)]
     start: Option<String>,
 
-    /// End time (ISO 8601, e.g. 2026-03-01T00:00:00Z). Defaults to now.
+    /// End time (ISO 8601, e.g. 2026-03-01T00:00:00Z). Defaults to now for regular payouts; required for bonus payouts.
     #[arg(long)]
     end: Option<String>,
 
@@ -42,9 +42,40 @@ struct PayoutArgs {
     #[arg(long)]
     stardust_rate: f64,
 
+    /// Make this a one-off bonus payout (requires --start, --end and --message)
+    #[arg(long)]
+    bonus: bool,
+
+    /// Memo for a bonus payout (required with --bonus)
+    #[arg(long)]
+    message: Option<String>,
+
     /// Actually send payouts. Without this flag the command only reports what it would do.
     #[arg(long)]
     execute: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionType {
+    Regular,
+    Bonus,
+}
+
+impl SessionType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Regular => "regular",
+            Self::Bonus => "bonus",
+        }
+    }
+
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "regular" => Ok(Self::Regular),
+            "bonus" => Ok(Self::Bonus),
+            other => Err(anyhow!("unknown payout session type `{other}`")),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -57,17 +88,21 @@ struct User {
 
 struct Session {
     id: i64,
+    kind: SessionType,
     period_start: OffsetDateTime,
     period_end: OffsetDateTime,
     stardust_rate: f64,
     started_at: OffsetDateTime,
+    memo: Option<String>,
 }
 
 enum SessionRun {
     New {
+        kind: SessionType,
         period_start: OffsetDateTime,
         period_end: OffsetDateTime,
         rate: f64,
+        memo: Option<String>,
     },
     Resume(Session),
 }
@@ -163,12 +198,21 @@ fn payout_reason(
     period_end: OffsetDateTime,
     tickets: i64,
     session_id: i64,
+    memo: Option<&str>,
 ) -> String {
-    format!(
-        "Support Scouts payout from {} to {} tkts={tickets} session={session_id}",
-        format_date(period_start),
-        format_date(period_end)
-    )
+    match memo {
+        Some(memo) => format!(
+            "Support Scouts payout for {} start={} end={} tkts={tickets} session={session_id}",
+            memo,
+            period_start.to_string(),
+            period_end
+        ),
+        None => format!(
+            "Support Scouts payout from {} to {} tkts={tickets} session={session_id}",
+            format_date(period_start),
+            format_date(period_end)
+        ),
+    }
 }
 
 fn get_stardance_user(
@@ -251,11 +295,13 @@ fn post_balance_adjustment(
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS payout_session (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL DEFAULT 'regular' CHECK (type IN ('regular', 'bonus')),
     period_start TEXT NOT NULL,
     period_end TEXT NOT NULL,
     stardust_rate REAL NOT NULL,
     started_at TEXT NOT NULL,
-    completed_at TEXT
+    completed_at TEXT,
+    memo TEXT
 );
 
 CREATE TABLE IF NOT EXISTS user (
@@ -344,32 +390,52 @@ fn run_payout(
 ) -> anyhow::Result<()> {
     let db = get_db(database_file)?;
 
-    let (period_start, period_end, rate, resume) = match resolve_session(&db, &args)? {
+    let (kind, period_start, period_end, rate, memo, resume) = match resolve_session(&db, &args)? {
         SessionRun::New {
+            kind,
             period_start,
             period_end,
             rate,
+            memo,
         } => {
-            log(format!(
-                "starting payout period {} .. {} at {rate} stardust/ticket",
-                format_time(period_start),
-                format_time(period_end)
-            ));
-            (period_start, period_end, rate, None)
+            match &memo {
+                Some(message) => log(format!(
+                    "starting bonus payout period {} .. {} at {rate} stardust/ticket ({message})",
+                    format_time(period_start),
+                    format_time(period_end)
+                )),
+                None => log(format!(
+                    "starting payout period {} .. {} at {rate} stardust/ticket",
+                    format_time(period_start),
+                    format_time(period_end)
+                )),
+            }
+            (kind, period_start, period_end, rate, memo, None)
         }
         SessionRun::Resume(session) => {
+            let memo_description = session
+                .memo
+                .as_deref()
+                .map(|message| format!(" ({message})"))
+                .unwrap_or_default();
             log(format!(
-                "resuming payout session {} (started {}), period {} .. {} at {} stardust/ticket",
+                "resuming {} payout session {} (started {}), period {} .. {} at {} stardust/ticket{}",
+                session.kind.as_str(),
                 session.id,
                 format_time(session.started_at),
                 format_time(session.period_start),
                 format_time(session.period_end),
-                session.stardust_rate
+                session.stardust_rate,
+                memo_description
             ));
+            let memo = session.memo.clone();
+            let kind = session.kind;
             (
+                kind,
                 session.period_start,
                 session.period_end,
                 session.stardust_rate,
+                memo,
                 Some(session),
             )
         }
@@ -411,17 +477,19 @@ fn run_payout(
         }
         None => {
             db.execute(
-                "INSERT INTO payout_session (period_start, period_end, stardust_rate, started_at) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO payout_session (type, period_start, period_end, stardust_rate, started_at, memo) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
+                    kind.as_str(),
                     format_time(period_start),
                     format_time(period_end),
                     rate,
-                    format_time(OffsetDateTime::now_utc())
+                    format_time(OffsetDateTime::now_utc()),
+                    memo.as_deref()
                 ],
             )
             .context("failed to create payout session")?;
             let id = db.last_insert_rowid();
-            log(format!("created payout session {id}"));
+            log(format!("created {} payout session {id}", kind.as_str()));
             (id, HashSet::new())
         }
     };
@@ -440,7 +508,14 @@ fn run_payout(
             continue;
         }
 
-        let reason = payout_reason(period_start, period_end, payout.tickets, session_id);
+        let reason = payout_reason(
+            period_start,
+            period_end,
+            payout.tickets,
+            session_id,
+            memo.as_deref(),
+        );
+        log(&reason);
 
         post_balance_adjustment(
             stardance_api,
@@ -627,13 +702,15 @@ fn load_paid_user_ids(db: &Connection, session_id: i64) -> anyhow::Result<HashSe
     Ok(user_ids)
 }
 
-type SessionRow = (i64, String, String, f64, String);
+type SessionRow = (i64, String, String, String, f64, String, Option<String>);
 
 fn parse_session(row: SessionRow) -> anyhow::Result<Session> {
-    let (id, period_start, period_end, stardust_rate, started_at) = row;
+    let (id, kind, period_start, period_end, stardust_rate, started_at, memo) = row;
 
     Ok(Session {
         id,
+        kind: SessionType::parse(&kind)
+            .with_context(|| format!("payout session {id} has an invalid type"))?,
         period_start: parse_time(&period_start)
             .with_context(|| format!("payout session {id} has an invalid period_start"))?,
         period_end: parse_time(&period_end)
@@ -641,6 +718,7 @@ fn parse_session(row: SessionRow) -> anyhow::Result<Session> {
         stardust_rate,
         started_at: parse_time(&started_at)
             .with_context(|| format!("payout session {id} has an invalid started_at"))?,
+        memo,
     })
 }
 
@@ -651,8 +729,10 @@ fn query_sessions(db: &Connection, sql: &str) -> anyhow::Result<Vec<Session>> {
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, f64>(3)?,
-            row.get::<_, String>(4)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, f64>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, Option<String>>(6)?,
         ))
     })?;
 
@@ -672,15 +752,25 @@ fn resolve_session(db: &Connection, args: &PayoutArgs) -> anyhow::Result<Session
         ));
     }
 
-    let completed = query_sessions(
-        db,
-        "SELECT id, period_start, period_end, stardust_rate, started_at
-         FROM payout_session
-         WHERE completed_at IS NOT NULL
-         ORDER BY id",
-    )?;
+    let requested = if args.bonus {
+        SessionType::Bonus
+    } else {
+        SessionType::Regular
+    };
 
-    for pair in completed.windows(2) {
+    let completed_regular = if requested == SessionType::Regular {
+        query_sessions(
+            db,
+            "SELECT id, type, period_start, period_end, stardust_rate, started_at, memo
+             FROM payout_session
+             WHERE completed_at IS NOT NULL AND type = 'regular'
+             ORDER BY id",
+        )?
+    } else {
+        Vec::new()
+    };
+
+    for pair in completed_regular.windows(2) {
         let previous = &pair[0];
         let next = &pair[1];
         if next.period_start < previous.period_end {
@@ -697,24 +787,35 @@ fn resolve_session(db: &Connection, args: &PayoutArgs) -> anyhow::Result<Session
 
     let incomplete = query_sessions(
         db,
-        "SELECT id, period_start, period_end, stardust_rate, started_at
+        "SELECT id, type, period_start, period_end, stardust_rate, started_at, memo
          FROM payout_session
          WHERE completed_at IS NULL
          ORDER BY id",
     )?;
 
     if incomplete.len() > 1 {
-        let ids: Vec<String> = incomplete
+        let sessions: Vec<String> = incomplete
             .iter()
-            .map(|session| session.id.to_string())
+            .map(|session| format!("{} ({})", session.id, session.kind.as_str()))
             .collect();
         return Err(anyhow!(
             "found multiple incomplete payout sessions ({}); resolve them manually before running again",
-            ids.join(", ")
+            sessions.join(", ")
         ));
     }
 
     if let Some(session) = incomplete.into_iter().next() {
+        if session.kind != requested {
+            let resume_hint = match session.kind {
+                SessionType::Bonus => "rerun with --bonus to resume it",
+                SessionType::Regular => "rerun without --bonus to resume it",
+            };
+            return Err(anyhow!(
+                "payout session {} is an incomplete {} session; {resume_hint}",
+                session.id,
+                session.kind.as_str()
+            ));
+        }
         if args.start.is_some() || args.end.is_some() {
             return Err(anyhow!(
                 "payout session {} is incomplete; rerun without --start/--end to resume it",
@@ -729,10 +830,65 @@ fn resolve_session(db: &Connection, args: &PayoutArgs) -> anyhow::Result<Session
                 args.stardust_rate
             ));
         }
+        match (requested, args.message.as_deref()) {
+            (SessionType::Regular, Some(_)) => {
+                return Err(anyhow!("--message is only valid with --bonus"));
+            }
+            (SessionType::Bonus, Some(message))
+                if Some(message.trim()) != session.memo.as_deref() =>
+            {
+                return Err(anyhow!(
+                    "payout session {} used the memo `{}`, but --message `{}` was given; rerun with the original memo or omit it",
+                    session.id,
+                    session.memo.as_deref().unwrap_or_default(),
+                    message.trim()
+                ));
+            }
+            _ => {}
+        }
         return Ok(SessionRun::Resume(session));
     }
 
-    let last_completed = completed.last();
+    if requested == SessionType::Bonus {
+        let start = args
+            .start
+            .as_deref()
+            .ok_or_else(|| anyhow!("bonus payouts require both --start and --end"))?;
+        let end = args
+            .end
+            .as_deref()
+            .ok_or_else(|| anyhow!("bonus payouts require both --start and --end"))?;
+        let memo = args
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+            .ok_or_else(|| anyhow!("bonus payouts require a non-empty --message"))?;
+
+        let period_start = parse_time(start)?;
+        let period_end = parse_time(end)?;
+        if period_end <= period_start {
+            return Err(anyhow!(
+                "period end {} must be after period start {}",
+                format_time(period_end),
+                format_time(period_start)
+            ));
+        }
+
+        return Ok(SessionRun::New {
+            kind: SessionType::Bonus,
+            period_start,
+            period_end,
+            rate: args.stardust_rate,
+            memo: Some(memo.to_string()),
+        });
+    }
+
+    if args.message.is_some() {
+        return Err(anyhow!("--message is only valid with --bonus"));
+    }
+
+    let last_completed = completed_regular.last();
 
     let period_start = match (&args.start, last_completed) {
         (Some(value), _) => parse_time(value)?,
@@ -769,9 +925,11 @@ fn resolve_session(db: &Connection, args: &PayoutArgs) -> anyhow::Result<Session
     }
 
     Ok(SessionRun::New {
+        kind: SessionType::Regular,
         period_start,
         period_end,
         rate: args.stardust_rate,
+        memo: None,
     })
 }
 
@@ -923,8 +1081,12 @@ mod tests {
         let end = parse_time("2026-10-10T00:00:00Z").expect("valid timestamp");
 
         assert_eq!(
-            payout_reason(start, end, 52, 1),
+            payout_reason(start, end, 52, 1, None),
             "Support Scouts payout from 16 Sep 2026 to 10 Oct 2026 tkts=52 session=1"
+        );
+        assert_eq!(
+            payout_reason(start, end, 52, 1, Some("Tuesday lock-in huddle")),
+            "Support Scouts payout from 16 Sep 2026 to 10 Oct 2026 tkts=52 session=1 \"Tuesday lock-in huddle\""
         );
     }
 
@@ -979,9 +1141,34 @@ mod tests {
         period_end: &str,
         completed: bool,
     ) -> i64 {
+        insert_session_of_type(
+            db,
+            SessionType::Regular,
+            period_start,
+            period_end,
+            completed,
+            None,
+        )
+    }
+
+    fn insert_session_of_type(
+        db: &Connection,
+        kind: SessionType,
+        period_start: &str,
+        period_end: &str,
+        completed: bool,
+        memo: Option<&str>,
+    ) -> i64 {
         db.execute(
-            "INSERT INTO payout_session (period_start, period_end, stardust_rate, started_at, completed_at) VALUES (?1, ?2, 0.4, ?3, ?4)",
-            rusqlite::params![period_start, period_end, period_end, completed.then_some(period_end)],
+            "INSERT INTO payout_session (type, period_start, period_end, stardust_rate, started_at, completed_at, memo) VALUES (?1, ?2, ?3, 0.4, ?4, ?5, ?6)",
+            rusqlite::params![
+                kind.as_str(),
+                period_start,
+                period_end,
+                period_end,
+                completed.then_some(period_end),
+                memo
+            ],
         )
         .expect("insert session");
         db.last_insert_rowid()
@@ -995,6 +1182,8 @@ mod tests {
             start: None,
             end: None,
             stardust_rate: 0.4,
+            bonus: false,
+            message: None,
             execute: false,
         };
 
@@ -1014,6 +1203,8 @@ mod tests {
             start: None,
             end: None,
             stardust_rate: 0.4,
+            bonus: false,
+            message: None,
             execute: false,
         };
 
@@ -1037,6 +1228,8 @@ mod tests {
             start: None,
             end: None,
             stardust_rate: 0.4,
+            bonus: false,
+            message: None,
             execute: false,
         };
 
@@ -1060,5 +1253,90 @@ mod tests {
 
         let paid = load_paid_user_ids(&db, session_id).expect("load paid users");
         assert_eq!(paid, HashSet::from([158]));
+    }
+
+    #[test]
+    fn bonus_requires_start_end_and_message() {
+        let db = test_db();
+        let args = PayoutArgs {
+            start: None,
+            end: None,
+            stardust_rate: 0.4,
+            bonus: true,
+            message: None,
+            execute: false,
+        };
+
+        assert!(resolve_session(&db, &args).is_err());
+    }
+
+    #[test]
+    fn regular_ignores_completed_bonus_sessions() {
+        let db = test_db();
+        insert_session_with_period(&db, "2026-10-01T00:00:00Z", "2026-10-08T00:00:00Z", true);
+        insert_session_of_type(
+            &db,
+            SessionType::Bonus,
+            "2026-11-01T00:00:00Z",
+            "2026-11-08T00:00:00Z",
+            true,
+            Some("Tuesday lock-in huddle"),
+        );
+
+        let expected_start = parse_time("2026-10-08T00:00:00Z").expect("valid timestamp");
+        let args = PayoutArgs {
+            start: None,
+            end: None,
+            stardust_rate: 0.4,
+            bonus: false,
+            message: None,
+            execute: false,
+        };
+
+        let resolved = resolve_session(&db, &args).expect("resolve session");
+        assert!(
+            matches!(
+                resolved,
+                SessionRun::New { period_start, .. } if period_start == expected_start
+            ),
+            "regular payouts should ignore bonus sessions"
+        );
+    }
+
+    #[test]
+    fn incomplete_bonus_blocks_regular_and_is_resumed_by_bonus() {
+        let db = test_db();
+        let id = insert_session_of_type(
+            &db,
+            SessionType::Bonus,
+            "2026-10-01T00:00:00Z",
+            "2026-10-08T00:00:00Z",
+            false,
+            Some("Tuesday lock-in huddle"),
+        );
+
+        let regular = PayoutArgs {
+            start: None,
+            end: None,
+            stardust_rate: 0.4,
+            bonus: false,
+            message: None,
+            execute: false,
+        };
+        assert!(resolve_session(&db, &regular).is_err());
+
+        let bonus = PayoutArgs {
+            start: None,
+            end: None,
+            stardust_rate: 0.4,
+            bonus: true,
+            message: None,
+            execute: false,
+        };
+        let resolved = resolve_session(&db, &bonus).expect("resolve session");
+        assert!(
+            matches!(resolved, SessionRun::Resume(ref session) if session.id == id),
+            "expected to resume the bonus session {id}"
+        );
     }
 }

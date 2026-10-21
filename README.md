@@ -21,9 +21,11 @@ STARDANCE_API_KEY='sd_sk_aaaaaaaaaaaaaaaa'
 Usage: crimson payout [OPTIONS] --stardust-rate <STARDUST_RATE>
 
 Options:
-      --start <START>                  Start time (ISO 8601, e.g. 2026-02-01T00:00:00Z). Required on the first run
-      --end <END>                      End time (ISO 8601, e.g. 2026-03-01T00:00:00Z). Defaults to now
+      --start <START>                  Start time (ISO 8601, e.g. 2026-02-01T00:00:00Z). Required on the first regular run and for bonus payouts
+      --end <END>                      End time (ISO 8601, e.g. 2026-03-01T00:00:00Z). Defaults to now for regular payouts; required for bonus payouts
       --stardust-rate <STARDUST_RATE>  Stardust paid out per closed ticket
+      --bonus                          Make this a one-off bonus payout (requires --start, --end and --message)
+      --message <MESSAGE>              Memo for a bonus payout (required with --bonus)
       --execute                        Actually send payouts. Without this flag the command only reports what it would do
   -h, --help                           Print help
 ```
@@ -47,6 +49,18 @@ By default, this will pay out all for tickets closed since the last payout sessi
 ```bash
 cargo run -- payout --stardust-rate 0.4
 ```
+
+#### Bonus payouts
+
+One-off bonuses (e.g. for a lock-in huddle) use `--bonus`, an explicit ticket period, and a short memo. The memo is stored with the session and appended to the Stardance reason in quotes.
+
+```bash
+cargo run -- payout --bonus \
+  --start "2026-10-06T17:00Z" --end "2026-10-06T22:00Z" \
+  --stardust-rate 0.2 --message "Tuesday lock-in huddle"
+```
+
+Bonus sessions are recorded like regular ones, but are ignored when calculating the next regular payout's start date, so they can overlap regular periods. Add `--execute` to actually send one.
 
 #### Excluding people from payouts
 
