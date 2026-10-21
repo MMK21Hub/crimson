@@ -1,3 +1,6 @@
 - Prefers configurable paths (e.g., database location) exposed as CLI flags with sensible defaults rather than environment variables. Confidence: 0.7
+- Wants configuration values (e.g., an API base URL) to fall back to a sensible built-in default instead of hard-failing when the env var is unset — prefer `.unwrap_or_else(|| default)` over a required-var error. Confidence: 0.6
 - Expects parent directories to be created automatically when a referenced file path doesn't exist (e.g., `create_dir_all` before opening a database file). Confidence: 0.7
 - Prefers race-condition-safe code: avoids check-then-act (e.g., `exists()` before creating) in favor of idempotent atomic operations like `create_dir_all`. Confidence: 0.6
+- Wants panics avoided in general ("please avoid panicking"): prefers fallible APIs that propagate errors — `try_get(...)?` over panicking `row.get(...)`, `try_from` over lossy `as` casts, no `unwrap`/`expect`/`panic!` in library-ish code. Confidence: 0.85
+- Expects integrations to follow the real upstream API contract (consult the provided docs/OpenAPI spec) — no leftover fetching code from a previously used API, and no speculative fallback matching in place of the actual endpoint semantics. Confidence: 0.6

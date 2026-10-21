@@ -36,9 +36,9 @@ struct PayoutArgs {
     #[arg(long)]
     end: Option<String>,
 
-    /// Pays out helpers at a fixed rate of X cookies per ticket
+    /// Pays out helpers at a fixed rate of X stardust per ticket
     #[clap(long)]
-    cookie_rate: Option<f64>,
+    stardust_rate: Option<f64>,
 }
 
 struct PayoutSession {
@@ -66,27 +66,22 @@ struct User {
 #[derive(Deserialize, Debug)]
 struct StardanceUser {
     id: i64,
-    slack_id: String,
 }
 
-#[derive(Deserialize, Debug)]
-struct StardanceUsersResponse {
-    users: Vec<StardanceUser>,
-}
-
-fn get_stardance_users(
+fn get_stardance_user(
     stardance_api: &Url,
     stardance_api_key: &str,
-    query: &str,
-) -> Result<StardanceUsersResponse, anyhow::Error> {
+    slack_id: &str,
+) -> Result<StardanceUser, anyhow::Error> {
     let client = reqwest::blocking::Client::new();
-    let mut url = stardance_api.join("users")?;
-    url.query_pairs_mut().append_pair("query", query);
+    let base = format!("{}/", stardance_api.as_str().trim_end_matches('/'));
+    let mut url = Url::parse(&base)?.join("users/lookup")?;
+    url.query_pairs_mut().append_pair("slack_id", slack_id);
     let response = client
         .get(url)
         .header("Authorization", format!("Bearer {}", stardance_api_key))
         .send()
-        .context("Failed to fetch users from Stardance API")?;
+        .context("Failed to fetch user from Stardance API")?;
     if !response.status().is_success() {
         return Err(anyhow!(
             "Stardance API returned error: {} - {}",
@@ -94,9 +89,9 @@ fn get_stardance_users(
             response.text().unwrap_or_default()
         ));
     }
-    let data: StardanceUsersResponse = response
+    let data: StardanceUser = response
         .json()
-        .context("Invalid users response from Stardance API")?;
+        .context("Invalid user response from Stardance API")?;
 
     Ok(data)
 }
@@ -148,7 +143,7 @@ fn main() -> anyhow::Result<()> {
     let nephthys_db_url =
         std::env::var("NEPHTHYS_DB_URL").context("NEPHTHYS_DB_URL environment variable not set")?;
     let stardance_api = std::env::var("STARDANCE_API_URL")
-        .context("STARDANCE_API_URL environment variable not set")?;
+        .unwrap_or_else(|_| "https://stardance.hackclub.com/api/v1".to_string());
     let stardance_api =
         Url::parse(&stardance_api).context("STARDANCE_API_URL is not a valid URL")?;
     if stardance_api.path().trim_end_matches("/") != "/api/v1" {
@@ -199,20 +194,15 @@ fn fetch_helpers_from_nephthys(
 
     let mut users = Vec::with_capacity(rows.len());
     for row in rows {
-        let id: i64 = row.get("id");
-        let slack_id: &str = row.get("slack_id");
+        let id: i32 = row.try_get("id")?;
+        let slack_id: &str = row.try_get("slack_id")?;
 
-        let stardance_users = get_stardance_users(stardance_api, stardance_api_key, slack_id)?;
-        let stardance_user = stardance_users
-            .users
-            .iter()
-            .find(|u| u.slack_id == slack_id)
-            .or_else(|| stardance_users.users.first())
-            .ok_or_else(|| anyhow!("Stardance API returned no users for Slack ID {slack_id}"))?;
+        let stardance_user = get_stardance_user(stardance_api, stardance_api_key, slack_id)?;
 
         users.push(User {
-            id: id as u64,
-            stardance_id: stardance_user.id as u64,
+            id: u64::try_from(id).context("Nephthys returned a negative user ID")?,
+            stardance_id: u64::try_from(stardance_user.id)
+                .context("Stardance API returned a negative user ID")?,
             slack_id: slack_id.to_string(),
         });
     }
@@ -268,14 +258,12 @@ fn get_helper_leaderboard(
         &[&start_time, &end_time],
     )?;
 
-    let hashmap: HashMap<String, i64> = rows
-        .iter()
-        .map(|row| {
-            let slack_id: &str = row.get("slack_id");
-            let tickets_closed: i64 = row.get("tickets_closed");
-            (slack_id.to_string(), tickets_closed)
-        })
-        .collect();
+    let mut hashmap: HashMap<String, i64> = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let slack_id: &str = row.try_get("slack_id")?;
+        let tickets_closed: i64 = row.try_get("tickets_closed")?;
+        hashmap.insert(slack_id.to_string(), tickets_closed);
+    }
 
-    return Ok(hashmap);
+    Ok(hashmap)
 }
