@@ -52,6 +52,7 @@ struct User {
     id: u64,
     stardance_id: u64,
     slack_id: String,
+    excluded: bool,
 }
 
 struct Session {
@@ -73,6 +74,7 @@ enum SessionRun {
 
 struct Payout {
     user: User,
+    tickets: i64,
     amount: i64,
     unrounded_amount: f64,
     justification: String,
@@ -107,6 +109,16 @@ fn format_time(value: OffsetDateTime) -> String {
     value
         .format(&Rfc3339)
         .unwrap_or_else(|_| value.unix_timestamp().to_string())
+}
+
+const HUMAN_DATE_FORMAT: &[time::format_description::FormatItem<'static>] =
+    time::macros::format_description!("[day padding:none] [month repr:short] [year]");
+
+fn format_date(value: OffsetDateTime) -> String {
+    value
+        .to_offset(time::UtcOffset::UTC)
+        .format(HUMAN_DATE_FORMAT)
+        .unwrap_or_else(|_| format_time(value))
 }
 
 const NO_SECONDS_FORMAT: &[time::format_description::FormatItem<'static>] =
@@ -144,6 +156,19 @@ fn round_stardust(tickets: i64, rate: f64) -> anyhow::Result<i64> {
 
 fn justification(tickets: i64, rate: f64) -> String {
     format!("{tickets} tkts * {rate} sd/tkt")
+}
+
+fn payout_reason(
+    period_start: OffsetDateTime,
+    period_end: OffsetDateTime,
+    tickets: i64,
+    session_id: i64,
+) -> String {
+    format!(
+        "Support Scouts payout from {} to {} tkts={tickets} session={session_id}",
+        format_date(period_start),
+        format_date(period_end)
+    )
 }
 
 fn get_stardance_user(
@@ -236,7 +261,8 @@ CREATE TABLE IF NOT EXISTS payout_session (
 CREATE TABLE IF NOT EXISTS user (
     id INTEGER PRIMARY KEY,
     stardance_id INTEGER NOT NULL UNIQUE,
-    slack_id TEXT NOT NULL UNIQUE
+    slack_id TEXT NOT NULL UNIQUE,
+    excluded INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS payout_transaction (
@@ -363,17 +389,13 @@ fn run_payout(
         return Ok(());
     }
 
-    let users = sync_helpers_from_nephthys(
+    let users_by_slack = sync_helpers_from_nephthys(
         nephthys_db,
         &db,
         stardance_api,
         stardance_api_key,
         &ticket_counts,
     )?;
-    let users_by_slack: HashMap<String, User> = users
-        .into_iter()
-        .map(|user| (user.slack_id.clone(), user))
-        .collect();
 
     let payouts = build_payouts(&ticket_counts, &users_by_slack, rate)?;
 
@@ -418,17 +440,19 @@ fn run_payout(
             continue;
         }
 
+        let reason = payout_reason(period_start, period_end, payout.tickets, session_id);
+
         post_balance_adjustment(
             stardance_api,
             stardance_api_key,
             payout.user.stardance_id,
             payout.amount,
-            &payout.justification,
+            &reason,
         )
         .with_context(|| {
             format!(
-                "failed to pay {} (Stardance #{}): {}",
-                payout.user.slack_id, payout.user.stardance_id, payout.justification
+                "failed to pay {} (Stardance #{}): {reason}",
+                payout.user.slack_id, payout.user.stardance_id
             )
         })?;
 
@@ -445,8 +469,8 @@ fn run_payout(
         .with_context(|| format!("failed to record payout for {}", payout.user.slack_id))?;
 
         log(format!(
-            "paid {} (Stardance #{}) {} stardust: {}",
-            payout.user.slack_id, payout.user.stardance_id, payout.amount, payout.justification
+            "paid {} (Stardance #{}) {} stardust: {reason}",
+            payout.user.slack_id, payout.user.stardance_id, payout.amount
         ));
         paid_count += 1;
         paid_stardust += payout.amount;
@@ -471,12 +495,20 @@ fn dry_run(db: &Connection, ticket_counts: &HashMap<String, i64>, rate: f64) -> 
     sorted.sort_by(|a, b| a.0.cmp(b.0));
 
     let mut resolved = 0usize;
-    let mut unresolved = 0usize;
+    let mut unknown_users = 0usize;
+    let mut excluded = 0usize;
     let mut total_stardust = 0i64;
 
     for (slack_id, tickets) in sorted {
         match users.get(slack_id) {
             Some(user) => {
+                if user.excluded {
+                    excluded += 1;
+                    log(format!(
+                        "{slack_id}: excluded from payouts ({tickets} tickets ignored)"
+                    ));
+                    continue;
+                }
                 resolved += 1;
                 let amount = round_stardust(*tickets, rate)?;
                 let unrounded = format!("{:.2}", *tickets as f64 * rate);
@@ -493,7 +525,7 @@ fn dry_run(db: &Connection, ticket_counts: &HashMap<String, i64>, rate: f64) -> 
                 }
             }
             None => {
-                unresolved += 1;
+                unknown_users += 1;
                 log(format!(
                     "{slack_id}: {tickets} tickets - Stardance ID unknown; would be resolved during --execute"
                 ));
@@ -502,7 +534,7 @@ fn dry_run(db: &Connection, ticket_counts: &HashMap<String, i64>, rate: f64) -> 
     }
 
     log(format!(
-        "dry run summary: {resolved} helpers with known Stardance IDs, {unresolved} unresolved, {total_stardust} stardust would be paid"
+        "dry run summary: {resolved} helpers with known Stardance IDs, {unknown_users} unknown users, {excluded} excluded, {total_stardust} stardust would be paid"
     ));
 
     Ok(())
@@ -522,6 +554,10 @@ fn build_payouts(
             .get(slack_id)
             .ok_or_else(|| anyhow!("no local user record found for helper {slack_id}"))?
             .clone();
+        if user.excluded {
+            log(format!("skipping {slack_id}: excluded from payouts"));
+            continue;
+        }
         let amount = round_stardust(*tickets, rate)?;
         if amount == 0 {
             log(format!(
@@ -531,6 +567,7 @@ fn build_payouts(
         }
         payouts.push(Payout {
             user,
+            tickets: *tickets,
             amount,
             unrounded_amount: *tickets as f64 * rate,
             justification: justification(*tickets, rate),
@@ -541,27 +578,41 @@ fn build_payouts(
 }
 
 fn load_local_users(db: &Connection) -> anyhow::Result<HashMap<String, User>> {
-    let mut stmt = db.prepare("SELECT id, stardance_id, slack_id FROM user")?;
+    let mut stmt = db.prepare("SELECT id, stardance_id, slack_id, excluded FROM user")?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, i64>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, bool>(3)?,
         ))
     })?;
 
     let mut users = HashMap::new();
     for row in rows {
-        let (id, stardance_id, slack_id) = row?;
+        let (id, stardance_id, slack_id, excluded) = row?;
         let user = User {
             id: u64::try_from(id).context("local user ID is negative")?,
             stardance_id: u64::try_from(stardance_id).context("local Stardance ID is negative")?,
             slack_id: slack_id.clone(),
+            excluded,
         };
         users.insert(slack_id, user);
     }
 
     Ok(users)
+}
+
+fn load_excluded_slack_ids(db: &Connection) -> anyhow::Result<HashSet<String>> {
+    let mut stmt = db.prepare("SELECT slack_id FROM user WHERE excluded = 1")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+
+    let mut slack_ids = HashSet::new();
+    for row in rows {
+        slack_ids.insert(row?);
+    }
+
+    Ok(slack_ids)
 }
 
 fn load_paid_user_ids(db: &Connection, session_id: i64) -> anyhow::Result<HashSet<i64>> {
@@ -730,6 +781,7 @@ fn fetch_helpers_from_nephthys(
     stardance_api: &Url,
     stardance_api_key: &str,
     helper_tickets: &HashMap<String, i64>,
+    excluded_slack_ids: &HashSet<String>,
 ) -> Result<Vec<User>, anyhow::Error> {
     let rows = nephthys_db.query(
         r#"
@@ -749,6 +801,10 @@ fn fetch_helpers_from_nephthys(
             continue;
         }
 
+        if excluded_slack_ids.contains(slack_id) {
+            continue;
+        }
+
         let stardance_user = get_stardance_user(stardance_api, stardance_api_key, slack_id)
             .with_context(|| format!("Failed to resolve Stardance user for Nephthys user {id}"))?;
 
@@ -757,6 +813,7 @@ fn fetch_helpers_from_nephthys(
             stardance_id: u64::try_from(stardance_user.id)
                 .context("Stardance API returned a negative user ID")?,
             slack_id: slack_id.to_string(),
+            excluded: false,
         });
     }
 
@@ -770,12 +827,14 @@ fn sync_helpers_from_nephthys(
     stardance_api: &Url,
     stardance_api_key: &str,
     helper_tickets: &HashMap<String, i64>,
-) -> Result<Vec<User>, anyhow::Error> {
+) -> Result<HashMap<String, User>, anyhow::Error> {
+    let excluded_slack_ids = load_excluded_slack_ids(crimson_db)?;
     let users = fetch_helpers_from_nephthys(
         nephthys_db,
         stardance_api,
         stardance_api_key,
         helper_tickets,
+        &excluded_slack_ids,
     )?;
 
     for user in &users {
@@ -795,7 +854,7 @@ fn sync_helpers_from_nephthys(
         )?;
     }
 
-    Ok(users)
+    load_local_users(crimson_db)
 }
 
 /// Returns a map of Slack IDs to tickets closed during the period
@@ -856,6 +915,47 @@ mod tests {
     #[test]
     fn formats_justification() {
         assert_eq!(justification(45, 0.3), "45 tkts * 0.3 sd/tkt");
+    }
+
+    #[test]
+    fn formats_payout_reason() {
+        let start = parse_time("2026-09-16T00:00:00Z").expect("valid timestamp");
+        let end = parse_time("2026-10-10T00:00:00Z").expect("valid timestamp");
+
+        assert_eq!(
+            payout_reason(start, end, 52, 1),
+            "Support Scouts payout from 16 Sep 2026 to 10 Oct 2026 tkts=52 session=1"
+        );
+    }
+
+    #[test]
+    fn skips_excluded_users() {
+        let user = User {
+            id: 1,
+            stardance_id: 158,
+            slack_id: "U073M5L9U13".to_string(),
+            excluded: true,
+        };
+        let users = HashMap::from([("U073M5L9U13".to_string(), user)]);
+        let tickets = HashMap::from([("U073M5L9U13".to_string(), 25)]);
+
+        let payouts = build_payouts(&tickets, &users, 0.4).expect("build payouts");
+        assert!(payouts.is_empty());
+    }
+
+    #[test]
+    fn loads_excluded_slack_ids() {
+        let db = test_db();
+        db.execute(
+            "INSERT INTO user (id, stardance_id, slack_id, excluded) VALUES (1, 158, 'U1', 1), (2, 159, 'U2', 0)",
+            [],
+        )
+        .expect("insert users");
+
+        assert_eq!(
+            load_excluded_slack_ids(&db).expect("load excluded users"),
+            HashSet::from(["U1".to_string()])
+        );
     }
 
     fn test_db() -> Connection {

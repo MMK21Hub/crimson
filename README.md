@@ -48,6 +48,18 @@ By default, this will pay out all for tickets closed since the last payout sessi
 cargo run -- payout --stardust-rate 0.4
 ```
 
+#### Excluding people from payouts
+
+People who are paid to work on Stardance are excluded from payouts, since they get paid Actual Money&trade; to answer questions. To accomplish this, set `excluded` to `1` in the database for all users who should be excluded. This has to be done after the users list is initialised.
+
+As of October 2026, the list of staff members to exclude should be this:
+
+```sql
+UPDATE user
+SET excluded = 1
+WHERE slack_id IN ('U08TCSANHDX','U09MY3SS6CV','U06PR6B8D37','U054VC2KM9P','U0AQSGVUUS3','U05F4B48GBF','U091PP9SN02','U0926UASBJ7','U0943NG73PA','U05PRRU5GSJ','U07BN55GN3D','U08R4KDL6UF','U07DJMFAQQP','U073M5L9U13','U09UQ385LSG','U09UE480JHH');
+```
+
 ## Credits
 
 Made with <3 by Mish for [Hack Club](https://hackclub.com/).
