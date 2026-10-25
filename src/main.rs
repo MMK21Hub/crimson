@@ -542,10 +542,19 @@ fn run_payout(
         planned_count += 1;
         planned_stardust += amount;
 
+        let reason = payout_reason(
+            period_start,
+            period_end,
+            *tickets,
+            session.as_ref().map(|s| s.id).unwrap_or(0),
+            memo.as_deref(),
+        );
+
         log(format!(
             "{slack_id} ({}): {tickets} tickets * {rate} = {unrounded:.2} -> {amount} stardust",
             user.display_name
         ));
+        log(reason.clone());
 
         let Some(session) = &session else {
             continue;
@@ -553,14 +562,6 @@ fn run_payout(
 
         let user_id = i64::try_from(user.id)
             .context("local user ID does not fit in a signed 64-bit integer")?;
-
-        let reason = payout_reason(
-            period_start,
-            period_end,
-            *tickets,
-            session.id,
-            memo.as_deref(),
-        );
 
         if session.paid_users.contains(&user_id) {
             log(format!(
@@ -1228,6 +1229,10 @@ mod tests {
         assert_eq!(
             payout_reason(start, end, 52, 1, Some("Tuesday lock-in huddle")),
             "Support Scouts payout for Tuesday lock-in huddle start=2026-09-16T00:00:00Z end=2026-10-10T00:00:00Z tkts=52 session=1"
+        );
+        assert_eq!(
+            payout_reason(start, end, 52, 0, None),
+            "Support Scouts payout from 16 Sep 2026 to 10 Oct 2026 tkts=52 session=0"
         );
     }
 
