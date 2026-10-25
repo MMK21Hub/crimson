@@ -15,6 +15,16 @@ NEPHTHYS_DB_URL='postgresql://username:password@coolify/nephthys'
 STARDANCE_API_KEY='sd_sk_aaaaaaaaaaaaaaaa'
 ```
 
+### Fetching helper info
+
+This is technically optional, but I recommend running `refresh-helpers` before anything else, to pull helper' user info from Stardance into the local database.
+
+```bash
+cargo run refresh-helpers
+```
+
+Otherwise, you will see "Stardance ID unknown" during dry runs.
+
 ### Issuing payouts
 
 ```none
@@ -64,7 +74,7 @@ Bonus sessions are recorded like regular ones, but are ignored when calculating 
 
 #### Excluding people from payouts
 
-People who are paid to work on Stardance are excluded from payouts, since they get paid Actual Money&trade; to answer questions. To accomplish this, set `excluded` to `1` in the database for all users who should be excluded. This has to be done after the users list is initialised.
+People who are paid to work on Stardance are excluded from payouts, since they get paid Actual Money&trade; to answer questions. To accomplish this, set `excluded` to `1` in the database for all users who should be excluded. This has to be done after the [users table is initialised](#fetching-helper-info).
 
 As of October 2026, the list of staff members to exclude should be this:
 
