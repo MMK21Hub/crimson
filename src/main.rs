@@ -133,6 +133,13 @@ struct BalanceAdjustmentResponse {
     amount: i64,
 }
 
+/// Stardance API HTTP client & config
+struct StardanceApi {
+    client: reqwest::blocking::Client,
+    base_url: Url,
+    api_key: String,
+}
+
 fn log(message: impl AsRef<str>) {
     eprintln!(
         "[{}] {}",
@@ -240,18 +247,13 @@ fn confirm_payout(display_name: &str, amount: i64) -> anyhow::Result<bool> {
     Ok(answer.is_empty() || answer.eq_ignore_ascii_case("y"))
 }
 
-fn get_stardance_user(
-    stardance_api: &Url,
-    stardance_api_key: &str,
-    slack_id: &str,
-) -> anyhow::Result<StardanceUser> {
-    let client = reqwest::blocking::Client::new();
-    let base = format!("{}/", stardance_api.as_str().trim_end_matches('/'));
-    let mut url = Url::parse(&base)?.join("users/lookup")?;
+fn get_stardance_user(api: &StardanceApi, slack_id: &str) -> anyhow::Result<StardanceUser> {
+    let mut url = api.base_url.join("users/lookup")?;
     url.query_pairs_mut().append_pair("slack_id", slack_id);
-    let response = client
+    let response = api
+        .client
         .get(url)
-        .header("Authorization", format!("Bearer {}", stardance_api_key))
+        .header("Authorization", format!("Bearer {}", api.api_key))
         .send()
         .context("Failed to fetch user from Stardance API")?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -272,19 +274,19 @@ fn get_stardance_user(
 }
 
 fn post_balance_adjustment(
-    stardance_api: &Url,
-    stardance_api_key: &str,
+    api: &StardanceApi,
     stardance_id: u64,
     amount: i64,
     reason: &str,
 ) -> anyhow::Result<()> {
-    let client = reqwest::blocking::Client::new();
-    let base = format!("{}/", stardance_api.as_str().trim_end_matches('/'));
-    let url = Url::parse(&base)?.join(&format!("users/{stardance_id}/balance_adjustments"))?;
+    let url = api
+        .base_url
+        .join(&format!("users/{stardance_id}/balance_adjustments"))?;
 
-    let response = client
+    let response = api
+        .client
         .post(url)
-        .header("Authorization", format!("Bearer {}", stardance_api_key))
+        .header("Authorization", format!("Bearer {}", api.api_key))
         .json(&BalanceAdjustment {
             amount,
             reason: reason.to_string(),
@@ -370,17 +372,22 @@ fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let nephthys_db_url =
         std::env::var("NEPHTHYS_DB_URL").context("NEPHTHYS_DB_URL environment variable not set")?;
-    let stardance_api = std::env::var("STARDANCE_API_URL")
+    let stardance_base_url = std::env::var("STARDANCE_API_URL")
         .unwrap_or_else(|_| "https://stardance.hackclub.com/api/v1".to_string());
-    let stardance_api =
-        Url::parse(&stardance_api).context("STARDANCE_API_URL is not a valid URL")?;
-    if stardance_api.path().trim_end_matches("/") != "/api/v1" {
+    let stardance_base_url =
+        Url::parse(&stardance_base_url).context("STARDANCE_API_URL is not a valid URL")?;
+    if stardance_base_url.path().trim_end_matches("/") != "/api/v1" {
         log(
             "warning: STARDANCE_API_URL does not end in `/api/v1`. Are you sure you have the full URL?",
         );
     }
     let stardance_api_key = std::env::var("STARDANCE_API_KEY")
         .context("STARDANCE_API_KEY environment variable not set")?;
+    let stardance_api = StardanceApi {
+        client: reqwest::blocking::Client::new(),
+        base_url: stardance_base_url,
+        api_key: stardance_api_key,
+    };
     let args = CrimsonArgs::parse();
 
     let nephthys_db = if let Ok(connector) = TlsConnector::new() {
@@ -400,14 +407,10 @@ fn main() -> anyhow::Result<()> {
             payout_args,
             &mut nephthys_db,
             &stardance_api,
-            &stardance_api_key,
         )?,
-        Command::RefreshHelpers => run_refresh_helpers(
-            &args.database_file,
-            &mut nephthys_db,
-            &stardance_api,
-            &stardance_api_key,
-        )?,
+        Command::RefreshHelpers => {
+            run_refresh_helpers(&args.database_file, &mut nephthys_db, &stardance_api)?
+        }
     }
 
     Ok(())
@@ -417,8 +420,7 @@ fn run_payout(
     database_file: &Path,
     args: PayoutArgs,
     nephthys_db: &mut Client,
-    stardance_api: &Url,
-    stardance_api_key: &str,
+    stardance_api: &StardanceApi,
 ) -> anyhow::Result<()> {
     let db = get_db(database_file)?;
 
@@ -484,13 +486,7 @@ fn run_payout(
     let wet = args.execute || args.execute_by_one;
 
     let users_by_slack = if wet {
-        sync_helpers_from_nephthys(
-            nephthys_db,
-            &db,
-            stardance_api,
-            stardance_api_key,
-            &ticket_counts,
-        )?
+        sync_helpers_from_nephthys(nephthys_db, &db, stardance_api, &ticket_counts)?
     } else {
         load_local_users(&db)?
     };
@@ -590,14 +586,9 @@ fn run_payout(
             continue;
         }
 
-        post_balance_adjustment(
-            stardance_api,
-            stardance_api_key,
-            user.stardance_id,
-            amount,
-            &reason,
-        )
-        .with_context(|| format!("failed to pay {slack_id} ({}): {reason}", user.display_name))?;
+        post_balance_adjustment(stardance_api, user.stardance_id, amount, &reason).with_context(
+            || format!("failed to pay {slack_id} ({}): {reason}", user.display_name),
+        )?;
 
         db.execute(
             "INSERT INTO payout_transaction (session, user, amount, unrounded_amount, justification) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1002,8 +993,7 @@ fn upsert_users(db: &Connection, users: &[User]) -> anyhow::Result<()> {
 /// that set are skipped.
 fn fetch_helpers_from_nephthys(
     nephthys_db: &mut Client,
-    stardance_api: &Url,
-    stardance_api_key: &str,
+    api: &StardanceApi,
     helper_tickets: &HashMap<String, i64>,
     excluded_slack_ids: Option<&HashSet<String>>,
 ) -> anyhow::Result<Vec<User>> {
@@ -1029,7 +1019,7 @@ fn fetch_helpers_from_nephthys(
             continue;
         }
 
-        let stardance_user = get_stardance_user(stardance_api, stardance_api_key, slack_id)
+        let stardance_user = get_stardance_user(api, slack_id)
             .with_context(|| format!("Failed to resolve Stardance user for Nephthys user {id}"))?;
 
         users.push(User {
@@ -1049,18 +1039,12 @@ fn fetch_helpers_from_nephthys(
 fn sync_helpers_from_nephthys(
     nephthys_db: &mut Client,
     crimson_db: &Connection,
-    stardance_api: &Url,
-    stardance_api_key: &str,
+    api: &StardanceApi,
     helper_tickets: &HashMap<String, i64>,
 ) -> anyhow::Result<HashMap<String, User>> {
     let excluded_slack_ids = load_excluded_slack_ids(crimson_db)?;
-    let users = fetch_helpers_from_nephthys(
-        nephthys_db,
-        stardance_api,
-        stardance_api_key,
-        helper_tickets,
-        Some(&excluded_slack_ids),
-    )?;
+    let users =
+        fetch_helpers_from_nephthys(nephthys_db, api, helper_tickets, Some(&excluded_slack_ids))?;
 
     upsert_users(crimson_db, &users)?;
 
@@ -1074,8 +1058,7 @@ fn sync_helpers_from_nephthys(
 fn run_refresh_helpers(
     database_file: &Path,
     nephthys_db: &mut Client,
-    stardance_api: &Url,
-    stardance_api_key: &str,
+    api: &StardanceApi,
 ) -> anyhow::Result<()> {
     let db = get_db(database_file)?;
 
@@ -1086,13 +1069,7 @@ fn run_refresh_helpers(
         ticket_counts.len()
     ));
 
-    let users = fetch_helpers_from_nephthys(
-        nephthys_db,
-        stardance_api,
-        stardance_api_key,
-        &ticket_counts,
-        None,
-    )?;
+    let users = fetch_helpers_from_nephthys(nephthys_db, api, &ticket_counts, None)?;
 
     upsert_users(&db, &users)?;
 
@@ -1104,9 +1081,7 @@ fn run_refresh_helpers(
 }
 
 /// Returns a map of Slack IDs to total tickets closed (all-time).
-fn get_helper_leaderboard_all_time(
-    db_client: &mut Client,
-) -> anyhow::Result<HashMap<String, i64>> {
+fn get_helper_leaderboard_all_time(db_client: &mut Client) -> anyhow::Result<HashMap<String, i64>> {
     let rows = db_client.query(
         r#"
         SELECT u."slackId" AS "slack_id", COUNT(*) AS "tickets_closed"
