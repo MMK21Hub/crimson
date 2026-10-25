@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(cargo:*)",
+      "Shell(sqlite3:*)",
+      "Shell(tail:*)"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}
