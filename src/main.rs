@@ -56,6 +56,10 @@ struct PayoutArgs {
     /// Actually send payouts. Without this flag the command only reports what it would do.
     #[arg(long)]
     execute: bool,
+
+    /// Actually send payouts, prompting for confirmation before each one. Incompatible with --execute.
+    #[arg(long, conflicts_with = "execute")]
+    execute_by_one: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +225,19 @@ fn payout_reason(
             format_date(period_end)
         ),
     }
+}
+
+/// Prompts on the terminal for confirmation before a payout. Returns true if the
+/// operator confirmed.
+fn confirm_payout(display_name: &str, amount: i64) -> anyhow::Result<bool> {
+    use std::io::Write;
+
+    print!("Pay {display_name} {amount} stardust? [Y/n] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let answer = line.trim();
+    Ok(answer.is_empty() || answer.eq_ignore_ascii_case("y"))
 }
 
 fn get_stardance_user(
@@ -464,7 +481,9 @@ fn run_payout(
         total_tickets
     ));
 
-    let users_by_slack = if args.execute {
+    let wet = args.execute || args.execute_by_one;
+
+    let users_by_slack = if wet {
         sync_helpers_from_nephthys(
             nephthys_db,
             &db,
@@ -476,7 +495,7 @@ fn run_payout(
         load_local_users(&db)?
     };
 
-    let session = if args.execute {
+    let session = if wet {
         Some(open_session(
             &db,
             resume,
@@ -502,7 +521,7 @@ fn run_payout(
     for (slack_id, tickets) in sorted {
         let user = match users_by_slack.get(slack_id) {
             Some(user) => user,
-            None if args.execute => {
+            None if wet => {
                 return Err(anyhow!("no local user record found for helper {slack_id}"));
             }
             None => {
@@ -567,6 +586,14 @@ fn run_payout(
             log(format!(
                 "{slack_id} ({}) already paid in session {}, skipping",
                 user.display_name, session.id
+            ));
+            continue;
+        }
+
+        if args.execute_by_one && !confirm_payout(&user.display_name, amount)? {
+            log(format!(
+                "{slack_id} ({}) skipped by operator",
+                user.display_name
             ));
             continue;
         }
@@ -1316,6 +1343,7 @@ mod tests {
             bonus: false,
             message: None,
             execute: false,
+            execute_by_one: false,
         };
 
         let resolved = resolve_session(&db, &args).expect("resolve session");
@@ -1337,6 +1365,7 @@ mod tests {
             bonus: false,
             message: None,
             execute: false,
+            execute_by_one: false,
         };
 
         let resolved = resolve_session(&db, &args).expect("resolve session");
@@ -1362,6 +1391,7 @@ mod tests {
             bonus: false,
             message: None,
             execute: false,
+            execute_by_one: false,
         };
 
         assert!(resolve_session(&db, &args).is_err());
@@ -1396,6 +1426,7 @@ mod tests {
             bonus: true,
             message: None,
             execute: false,
+            execute_by_one: false,
         };
 
         assert!(resolve_session(&db, &args).is_err());
@@ -1422,6 +1453,7 @@ mod tests {
             bonus: false,
             message: None,
             execute: false,
+            execute_by_one: false,
         };
 
         let resolved = resolve_session(&db, &args).expect("resolve session");
@@ -1453,6 +1485,7 @@ mod tests {
             bonus: false,
             message: None,
             execute: false,
+            execute_by_one: false,
         };
         assert!(resolve_session(&db, &regular).is_err());
 
@@ -1463,6 +1496,7 @@ mod tests {
             bonus: true,
             message: None,
             execute: false,
+            execute_by_one: false,
         };
         let resolved = resolve_session(&db, &bonus).expect("resolve session");
         assert!(
