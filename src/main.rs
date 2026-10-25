@@ -16,7 +16,7 @@ use time::format_description::well_known::{Iso8601, Rfc3339, iso8601};
 #[derive(Parser)]
 struct CrimsonArgs {
     /// Path to the SQLite database file
-    #[arg(long, default_value = "data/crimson.db")]
+    #[arg(long, short = 'd', default_value = "data/crimson.db")]
     database_file: std::path::PathBuf,
 
     #[clap(subcommand)]
