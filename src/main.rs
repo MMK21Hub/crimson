@@ -25,6 +25,7 @@ struct CrimsonArgs {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Issue payouts to helpers!
     Payout(PayoutArgs),
     /// Refresh the local user table from Nephthys without calculating payouts.
     RefreshHelpers,
@@ -85,6 +86,7 @@ struct User {
     id: u64,
     stardance_id: u64,
     slack_id: String,
+    display_name: String,
     excluded: bool,
 }
 
@@ -112,6 +114,7 @@ enum SessionRun {
 #[derive(Deserialize)]
 struct StardanceUser {
     id: i64,
+    display_name: String,
 }
 
 #[derive(serde::Serialize)]
@@ -313,6 +316,7 @@ CREATE TABLE IF NOT EXISTS user (
     id INTEGER PRIMARY KEY,
     stardance_id INTEGER NOT NULL UNIQUE,
     slack_id TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL DEFAULT '',
     excluded INTEGER NOT NULL DEFAULT 0
 );
 
@@ -493,6 +497,7 @@ fn run_payout(
     let mut paid_stardust = 0i64;
     let mut planned_count = 0usize;
     let mut planned_stardust = 0i64;
+    let mut stardance_id_unknown_count = 0usize;
 
     for (slack_id, tickets) in sorted {
         let user = match users_by_slack.get(slack_id) {
@@ -502,8 +507,9 @@ fn run_payout(
             }
             None => {
                 log(format!(
-                    "{slack_id}: {tickets} tickets - Stardance ID unknown; would be resolved during --execute"
+                    "{slack_id}: {tickets} tickets - Stardance ID unknown"
                 ));
+                stardance_id_unknown_count += 1;
                 continue;
             }
         };
@@ -537,8 +543,8 @@ fn run_payout(
 
         let Some(session) = &session else {
             log(format!(
-                "{slack_id} (Stardance #{}): {tickets} tickets * {rate} = {unrounded:.2} -> {amount} stardust (dry run)",
-                user.stardance_id
+                "{slack_id} ({}): {tickets} tickets * {rate} = {unrounded:.2} -> {amount} stardust (dry run)",
+                user.display_name
             ));
             continue;
         };
@@ -556,8 +562,8 @@ fn run_payout(
 
         if session.paid_users.contains(&user_id) {
             log(format!(
-                "{slack_id} (Stardance #{}) already paid in session {}, skipping",
-                user.stardance_id, session.id
+                "{slack_id} ({}) already paid in session {}, skipping",
+                user.display_name, session.id
             ));
             continue;
         }
@@ -569,12 +575,7 @@ fn run_payout(
             amount,
             &reason,
         )
-        .with_context(|| {
-            format!(
-                "failed to pay {slack_id} (Stardance #{}): {reason}",
-                user.stardance_id
-            )
-        })?;
+        .with_context(|| format!("failed to pay {slack_id} ({}): {reason}", user.display_name))?;
 
         db.execute(
             "INSERT INTO payout_transaction (session, user, amount, unrounded_amount, justification) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -589,13 +590,18 @@ fn run_payout(
         .with_context(|| format!("failed to record payout for {slack_id}"))?;
 
         log(format!(
-            "paid {slack_id} (Stardance #{}) {amount} stardust: {reason}",
-            user.stardance_id
+            "paid {slack_id} ({}) {amount} stardust: {reason}",
+            user.display_name
         ));
         paid_count += 1;
         paid_stardust += amount;
     }
 
+    if stardance_id_unknown_count > 0 {
+        log(format!(
+            "{stardance_id_unknown_count} helpers are not in the local database: run `crimson refresh-helpers` to fetch user info for helpers"
+        ));
+    }
     if let Some(session) = &session {
         db.execute(
             "UPDATE payout_session SET completed_at = ?1 WHERE id = ?2",
@@ -667,23 +673,26 @@ fn open_session(
 }
 
 fn load_local_users(db: &Connection) -> anyhow::Result<HashMap<String, User>> {
-    let mut stmt = db.prepare("SELECT id, stardance_id, slack_id, excluded FROM user")?;
+    let mut stmt =
+        db.prepare("SELECT id, stardance_id, slack_id, display_name, excluded FROM user")?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, i64>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, bool>(3)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, bool>(4)?,
         ))
     })?;
 
     let mut users = HashMap::new();
     for row in rows {
-        let (id, stardance_id, slack_id, excluded) = row?;
+        let (id, stardance_id, slack_id, display_name, excluded) = row?;
         let user = User {
             id: u64::try_from(id).context("local user ID is negative")?,
             stardance_id: u64::try_from(stardance_id).context("local Stardance ID is negative")?,
             slack_id: slack_id.clone(),
+            display_name,
             excluded,
         };
         users.insert(slack_id, user);
@@ -985,6 +994,7 @@ fn fetch_helpers_from_nephthys(
             stardance_id: u64::try_from(stardance_user.id)
                 .context("Stardance API returned a negative user ID")?,
             slack_id: slack_id.to_string(),
+            display_name: stardance_user.display_name,
             excluded: false,
         });
     }
@@ -1016,13 +1026,14 @@ fn sync_helpers_from_nephthys(
 
         crimson_db.execute(
             r#"
-            INSERT INTO user (id, stardance_id, slack_id)
-            VALUES (?1, ?2, ?3)
+            INSERT INTO user (id, stardance_id, slack_id, display_name)
+            VALUES (?1, ?2, ?3, ?4)
             ON CONFLICT(id) DO UPDATE SET
                 stardance_id = excluded.stardance_id,
-                slack_id = excluded.slack_id;
+                slack_id = excluded.slack_id,
+                display_name = excluded.display_name;
             "#,
-            rusqlite::params![id, stardance_id, user.slack_id],
+            rusqlite::params![id, stardance_id, user.slack_id, user.display_name],
         )?;
     }
 
@@ -1062,17 +1073,21 @@ fn run_refresh_helpers(
 
         db.execute(
             r#"
-            INSERT INTO user (id, stardance_id, slack_id)
-            VALUES (?1, ?2, ?3)
+            INSERT INTO user (id, stardance_id, slack_id, display_name)
+            VALUES (?1, ?2, ?3, ?4)
             ON CONFLICT(id) DO UPDATE SET
                 stardance_id = excluded.stardance_id,
-                slack_id = excluded.slack_id;
+                slack_id = excluded.slack_id,
+                display_name = excluded.display_name;
             "#,
-            rusqlite::params![id, stardance_id, user.slack_id],
+            rusqlite::params![id, stardance_id, user.slack_id, user.display_name],
         )?;
     }
 
-    log(format!("synced {} helpers into local user table", users.len()));
+    log(format!(
+        "synced {} helpers into local user table",
+        users.len()
+    ));
     Ok(())
 }
 
@@ -1135,6 +1150,7 @@ fn fetch_helpers_from_nephthys_all_time(
             stardance_id: u64::try_from(stardance_user.id)
                 .context("Stardance API returned a negative user ID")?,
             slack_id: slack_id.to_string(),
+            display_name: stardance_user.display_name,
             excluded: false,
         });
     }
