@@ -26,6 +26,8 @@ struct CrimsonArgs {
 #[derive(Subcommand)]
 enum Command {
     Payout(PayoutArgs),
+    /// Refresh the local user table from Nephthys without calculating payouts.
+    RefreshHelpers,
 }
 
 #[derive(Args)]
@@ -375,6 +377,12 @@ fn main() -> anyhow::Result<()> {
         Command::Payout(payout_args) => run_payout(
             &args.database_file,
             payout_args,
+            &mut nephthys_db,
+            &stardance_api,
+            &stardance_api_key,
+        )?,
+        Command::RefreshHelpers => run_refresh_helpers(
+            &args.database_file,
             &mut nephthys_db,
             &stardance_api,
             &stardance_api_key,
@@ -1019,6 +1027,119 @@ fn sync_helpers_from_nephthys(
     }
 
     load_local_users(crimson_db)
+}
+
+/// Refreshes the local user table from Nephthys without calculating payouts.
+///
+/// Syncs helpers who have closed at least one ticket (all-time). The `excluded`
+/// column is left untouched: existing rows keep their flag, new rows default to 0.
+fn run_refresh_helpers(
+    database_file: &Path,
+    nephthys_db: &mut Client,
+    stardance_api: &Url,
+    stardance_api_key: &str,
+) -> anyhow::Result<()> {
+    let db = get_db(database_file)?;
+
+    let ticket_counts = get_helper_leaderboard_all_time(nephthys_db)?;
+    let total_tickets: i64 = ticket_counts.values().sum();
+    log(format!(
+        "{} helpers closed {total_tickets} tickets",
+        ticket_counts.len()
+    ));
+
+    let users = fetch_helpers_from_nephthys_all_time(
+        nephthys_db,
+        stardance_api,
+        stardance_api_key,
+        &ticket_counts,
+    )?;
+
+    for user in &users {
+        let id = i64::try_from(user.id).context("local user ID does not fit in INTEGER")?;
+        let stardance_id =
+            i64::try_from(user.stardance_id).context("Stardance ID does not fit in INTEGER")?;
+
+        db.execute(
+            r#"
+            INSERT INTO user (id, stardance_id, slack_id)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(id) DO UPDATE SET
+                stardance_id = excluded.stardance_id,
+                slack_id = excluded.slack_id;
+            "#,
+            rusqlite::params![id, stardance_id, user.slack_id],
+        )?;
+    }
+
+    log(format!("synced {} helpers into local user table", users.len()));
+    Ok(())
+}
+
+/// Returns a map of Slack IDs to total tickets closed (all-time).
+fn get_helper_leaderboard_all_time(
+    db_client: &mut Client,
+) -> Result<HashMap<String, i64>, anyhow::Error> {
+    let rows = db_client.query(
+        r#"
+        SELECT u."slackId" AS "slack_id", COUNT(*) AS "tickets_closed"
+        FROM "Ticket" t
+        JOIN "User" u ON u."id" = t."closedById"
+        WHERE u."helper" = true
+        GROUP BY u."slackId";
+    "#,
+        &[],
+    )?;
+
+    let mut hashmap: HashMap<String, i64> = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let slack_id: &str = row.try_get("slack_id")?;
+        let tickets_closed: i64 = row.try_get("tickets_closed")?;
+        hashmap.insert(slack_id.to_string(), tickets_closed);
+    }
+
+    Ok(hashmap)
+}
+
+/// Fetches helpers from Nephthys who have closed at least one ticket, resolving
+/// each helper's Stardance ID. Does not filter by `excluded`.
+fn fetch_helpers_from_nephthys_all_time(
+    nephthys_db: &mut Client,
+    stardance_api: &Url,
+    stardance_api_key: &str,
+    helper_tickets: &HashMap<String, i64>,
+) -> Result<Vec<User>, anyhow::Error> {
+    let rows = nephthys_db.query(
+        r#"
+        SELECT id, "slackId" AS slack_id
+        FROM "User"
+        WHERE helper = true;
+    "#,
+        &[],
+    )?;
+
+    let mut users = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: i32 = row.try_get("id")?;
+        let slack_id: &str = row.try_get("slack_id")?;
+
+        if helper_tickets.get(slack_id).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+
+        let stardance_user = get_stardance_user(stardance_api, stardance_api_key, slack_id)
+            .with_context(|| format!("Failed to resolve Stardance user for Nephthys user {id}"))?;
+
+        users.push(User {
+            id: u64::try_from(id).context("Nephthys returned a negative user ID")?,
+            stardance_id: u64::try_from(stardance_user.id)
+                .context("Stardance API returned a negative user ID")?,
+            slack_id: slack_id.to_string(),
+            excluded: false,
+        });
+    }
+
+    Ok(users)
 }
 
 /// Returns a map of Slack IDs to tickets closed during the period
