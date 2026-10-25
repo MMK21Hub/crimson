@@ -516,7 +516,8 @@ fn run_payout(
 
         if user.excluded {
             log(format!(
-                "{slack_id}: excluded from payouts ({tickets} tickets ignored)"
+                "{slack_id} ({}): excluded from payouts ({tickets} tickets ignored)",
+                user.display_name
             ));
             continue;
         }
@@ -541,11 +542,12 @@ fn run_payout(
         planned_count += 1;
         planned_stardust += amount;
 
+        log(format!(
+            "{slack_id} ({}): {tickets} tickets * {rate} = {unrounded:.2} -> {amount} stardust",
+            user.display_name
+        ));
+
         let Some(session) = &session else {
-            log(format!(
-                "{slack_id} ({}): {tickets} tickets * {rate} = {unrounded:.2} -> {amount} stardust (dry run)",
-                user.display_name
-            ));
             continue;
         };
 
@@ -589,10 +591,6 @@ fn run_payout(
         )
         .with_context(|| format!("failed to record payout for {slack_id}"))?;
 
-        log(format!(
-            "paid {slack_id} ({}) {amount} stardust: {reason}",
-            user.display_name
-        ));
         paid_count += 1;
         paid_stardust += amount;
     }
