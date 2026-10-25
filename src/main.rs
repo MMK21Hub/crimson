@@ -244,7 +244,7 @@ fn get_stardance_user(
     stardance_api: &Url,
     stardance_api_key: &str,
     slack_id: &str,
-) -> Result<StardanceUser, anyhow::Error> {
+) -> anyhow::Result<StardanceUser> {
     let client = reqwest::blocking::Client::new();
     let base = format!("{}/", stardance_api.as_str().trim_end_matches('/'));
     let mut url = Url::parse(&base)?.join("users/lookup")?;
@@ -547,14 +547,6 @@ fn run_payout(
             log(format!(
                 "{slack_id}: {tickets} tickets * {rate} = {unrounded:.2} -> 0 stardust (skipped)"
             ));
-            // Log for debugging payout memos
-            // log(payout_reason(
-            //     period_start,
-            //     period_end,
-            //     *tickets,
-            //     52,
-            //     memo.as_deref(),
-            // ));
             continue;
         }
 
@@ -573,7 +565,7 @@ fn run_payout(
             "{slack_id} ({}): {tickets} tickets * {rate} = {unrounded:.2} -> {amount} stardust",
             user.display_name
         ));
-        log(reason.clone());
+        log(&reason);
 
         let Some(session) = &session else {
             continue;
@@ -982,14 +974,39 @@ fn resolve_session(db: &Connection, args: &PayoutArgs) -> anyhow::Result<Session
     })
 }
 
-/// Fetches helpers from Nephthys, looking up each helper's Stardance ID.
+/// Upserts helpers into the local user table without touching the `excluded`
+/// column.
+fn upsert_users(db: &Connection, users: &[User]) -> anyhow::Result<()> {
+    for user in users {
+        let id = i64::try_from(user.id).context("local user ID does not fit in INTEGER")?;
+        let stardance_id =
+            i64::try_from(user.stardance_id).context("Stardance ID does not fit in INTEGER")?;
+
+        db.execute(
+            r#"
+            INSERT INTO user (id, stardance_id, slack_id, display_name)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(id) DO UPDATE SET
+                stardance_id = excluded.stardance_id,
+                slack_id = excluded.slack_id,
+                display_name = excluded.display_name;
+            "#,
+            rusqlite::params![id, stardance_id, user.slack_id, user.display_name],
+        )?;
+    }
+    Ok(())
+}
+
+/// Fetches helpers from Nephthys who have closed at least one ticket, resolving
+/// each helper's Stardance ID. If `excluded_slack_ids` is provided, helpers in
+/// that set are skipped.
 fn fetch_helpers_from_nephthys(
     nephthys_db: &mut Client,
     stardance_api: &Url,
     stardance_api_key: &str,
     helper_tickets: &HashMap<String, i64>,
-    excluded_slack_ids: &HashSet<String>,
-) -> Result<Vec<User>, anyhow::Error> {
+    excluded_slack_ids: Option<&HashSet<String>>,
+) -> anyhow::Result<Vec<User>> {
     let rows = nephthys_db.query(
         r#"
         SELECT id, "slackId" AS slack_id
@@ -1008,7 +1025,7 @@ fn fetch_helpers_from_nephthys(
             continue;
         }
 
-        if excluded_slack_ids.contains(slack_id) {
+        if excluded_slack_ids.is_some_and(|excluded| excluded.contains(slack_id)) {
             continue;
         }
 
@@ -1035,33 +1052,17 @@ fn sync_helpers_from_nephthys(
     stardance_api: &Url,
     stardance_api_key: &str,
     helper_tickets: &HashMap<String, i64>,
-) -> Result<HashMap<String, User>, anyhow::Error> {
+) -> anyhow::Result<HashMap<String, User>> {
     let excluded_slack_ids = load_excluded_slack_ids(crimson_db)?;
     let users = fetch_helpers_from_nephthys(
         nephthys_db,
         stardance_api,
         stardance_api_key,
         helper_tickets,
-        &excluded_slack_ids,
+        Some(&excluded_slack_ids),
     )?;
 
-    for user in &users {
-        let id = i64::try_from(user.id).context("local user ID does not fit in INTEGER")?;
-        let stardance_id =
-            i64::try_from(user.stardance_id).context("Stardance ID does not fit in INTEGER")?;
-
-        crimson_db.execute(
-            r#"
-            INSERT INTO user (id, stardance_id, slack_id, display_name)
-            VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(id) DO UPDATE SET
-                stardance_id = excluded.stardance_id,
-                slack_id = excluded.slack_id,
-                display_name = excluded.display_name;
-            "#,
-            rusqlite::params![id, stardance_id, user.slack_id, user.display_name],
-        )?;
-    }
+    upsert_users(crimson_db, &users)?;
 
     load_local_users(crimson_db)
 }
@@ -1085,30 +1086,15 @@ fn run_refresh_helpers(
         ticket_counts.len()
     ));
 
-    let users = fetch_helpers_from_nephthys_all_time(
+    let users = fetch_helpers_from_nephthys(
         nephthys_db,
         stardance_api,
         stardance_api_key,
         &ticket_counts,
+        None,
     )?;
 
-    for user in &users {
-        let id = i64::try_from(user.id).context("local user ID does not fit in INTEGER")?;
-        let stardance_id =
-            i64::try_from(user.stardance_id).context("Stardance ID does not fit in INTEGER")?;
-
-        db.execute(
-            r#"
-            INSERT INTO user (id, stardance_id, slack_id, display_name)
-            VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(id) DO UPDATE SET
-                stardance_id = excluded.stardance_id,
-                slack_id = excluded.slack_id,
-                display_name = excluded.display_name;
-            "#,
-            rusqlite::params![id, stardance_id, user.slack_id, user.display_name],
-        )?;
-    }
+    upsert_users(&db, &users)?;
 
     log(format!(
         "synced {} helpers into local user table",
@@ -1120,7 +1106,7 @@ fn run_refresh_helpers(
 /// Returns a map of Slack IDs to total tickets closed (all-time).
 fn get_helper_leaderboard_all_time(
     db_client: &mut Client,
-) -> Result<HashMap<String, i64>, anyhow::Error> {
+) -> anyhow::Result<HashMap<String, i64>> {
     let rows = db_client.query(
         r#"
         SELECT u."slackId" AS "slack_id", COUNT(*) AS "tickets_closed"
@@ -1142,54 +1128,12 @@ fn get_helper_leaderboard_all_time(
     Ok(hashmap)
 }
 
-/// Fetches helpers from Nephthys who have closed at least one ticket, resolving
-/// each helper's Stardance ID. Does not filter by `excluded`.
-fn fetch_helpers_from_nephthys_all_time(
-    nephthys_db: &mut Client,
-    stardance_api: &Url,
-    stardance_api_key: &str,
-    helper_tickets: &HashMap<String, i64>,
-) -> Result<Vec<User>, anyhow::Error> {
-    let rows = nephthys_db.query(
-        r#"
-        SELECT id, "slackId" AS slack_id
-        FROM "User"
-        WHERE helper = true;
-    "#,
-        &[],
-    )?;
-
-    let mut users = Vec::with_capacity(rows.len());
-    for row in rows {
-        let id: i32 = row.try_get("id")?;
-        let slack_id: &str = row.try_get("slack_id")?;
-
-        if helper_tickets.get(slack_id).copied().unwrap_or(0) == 0 {
-            continue;
-        }
-
-        let stardance_user = get_stardance_user(stardance_api, stardance_api_key, slack_id)
-            .with_context(|| format!("Failed to resolve Stardance user for Nephthys user {id}"))?;
-
-        users.push(User {
-            id: u64::try_from(id).context("Nephthys returned a negative user ID")?,
-            stardance_id: u64::try_from(stardance_user.id)
-                .context("Stardance API returned a negative user ID")?,
-            slack_id: slack_id.to_string(),
-            display_name: stardance_user.display_name,
-            excluded: false,
-        });
-    }
-
-    Ok(users)
-}
-
 /// Returns a map of Slack IDs to tickets closed during the period
 fn get_helper_leaderboard(
     db_client: &mut Client,
     start: OffsetDateTime,
     end: OffsetDateTime,
-) -> Result<HashMap<String, i64>, anyhow::Error> {
+) -> anyhow::Result<HashMap<String, i64>> {
     let rows = db_client.query(
         r#"
         SELECT u."slackId" AS "slack_id", COUNT(*) AS "tickets_closed"
