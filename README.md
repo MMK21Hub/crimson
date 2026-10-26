@@ -84,6 +84,35 @@ SET excluded = 1
 WHERE slack_id IN ('U08TCSANHDX','U09MY3SS6CV','U06PR6B8D37','U054VC2KM9P','U0AQSGVUUS3','U05F4B48GBF','U091PP9SN02','U0926UASBJ7','U0943NG73PA','U05PRRU5GSJ','U07BN55GN3D','U08R4KDL6UF','U07DJMFAQQP','U073M5L9U13','U09UQ385LSG','U09UE480JHH');
 ```
 
+## Build instructions
+
+### Native build
+
+You'll need Rust installed.
+
+```bash
+cargo build --release
+```
+
+```bash
+./target/release/crimson --help
+```
+
+### Cross-compilation
+
+Cross-compilation for Windows systems is simple and can be done with `cargo-zigbuild`:
+
+```bash
+cargo zigbuild --target x86_64-pc-windows-gnu --release
+cargo zigbuild --target aarch64-pc-windows-gnullvm --release
+```
+
+Cross-compilation for Linux must be done with `cross` and the Rust stable toolchain due to it having to link to the system OpenSSL dependency:
+
+```bash
+cross build --release --target aarch64-unknown-linux-gnu
+```
+
 ## Credits
 
 Made with <3 by Mish for [Hack Club](https://hackclub.com/).
