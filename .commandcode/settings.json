@@ -3,7 +3,9 @@
     "allow": [
       "Shell(cargo:*)",
       "Shell(sqlite3:*)",
-      "Shell(tail:*)"
+      "Shell(tail:*)",
+      "Shell(grep:*)",
+      "Shell(sed:*)"
     ],
     "deny": [],
     "defaultMode": "default"
