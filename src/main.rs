@@ -14,6 +14,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::{Iso8601, Rfc3339, iso8601};
 
 #[derive(Parser)]
+#[command(version)]
 struct CrimsonArgs {
     /// Path to the SQLite database file
     #[arg(long, short = 'd', default_value = "data/crimson.db")]
@@ -439,6 +440,8 @@ fn get_db(path: &Path) -> anyhow::Result<Connection> {
 }
 
 fn main() -> anyhow::Result<()> {
+    let args = CrimsonArgs::parse();
+
     dotenvy::dotenv().ok();
     let nephthys_db_url =
         std::env::var("NEPHTHYS_DB_URL").context("NEPHTHYS_DB_URL environment variable not set")?;
@@ -464,7 +467,6 @@ fn main() -> anyhow::Result<()> {
         base_url: stardance_base_url,
         api_key: stardance_api_key,
     };
-    let args = CrimsonArgs::parse();
 
     let nephthys_db = if let Ok(connector) = TlsConnector::new() {
         let tls = MakeTlsConnector::new(connector);
