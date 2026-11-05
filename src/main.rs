@@ -14,6 +14,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::{Iso8601, Rfc3339, iso8601};
 
 #[derive(Parser)]
+#[command(version)]
 struct CrimsonArgs {
     /// Path to the SQLite database file
     #[arg(long, short = 'd', default_value = "data/crimson.db")]
