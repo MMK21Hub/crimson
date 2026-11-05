@@ -374,11 +374,17 @@ fn main() -> anyhow::Result<()> {
         std::env::var("NEPHTHYS_DB_URL").context("NEPHTHYS_DB_URL environment variable not set")?;
     let stardance_base_url = std::env::var("STARDANCE_API_URL")
         .unwrap_or_else(|_| "https://stardance.hackclub.com/api/v1".to_string());
-    let stardance_base_url =
+    let mut stardance_base_url =
         Url::parse(&stardance_base_url).context("STARDANCE_API_URL is not a valid URL")?;
-    if stardance_base_url.path().trim_end_matches("/") != "/api/v1" {
+    // Ensure trailing slash
+    stardance_base_url
+        .path_segments_mut()
+        .map_err(|_| anyhow!("STARDANCE_API_URL must be a base URL"))?
+        .pop_if_empty()
+        .push("");
+    if stardance_base_url.path() != "/api/v1/" {
         log(
-            "warning: STARDANCE_API_URL does not end in `/api/v1`. Are you sure you have the full URL?",
+            "warning: STARDANCE_API_URL does not end in `/api/v1/`. Are you sure you have the full URL?",
         );
     }
     let stardance_api_key = std::env::var("STARDANCE_API_KEY")
