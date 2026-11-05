@@ -250,26 +250,36 @@ fn parse_time(value: &str) -> anyhow::Result<OffsetDateTime> {
     Ok(naive.assume_utc())
 }
 
-fn round_stardust(tickets: i64, rate: f64) -> anyhow::Result<i64> {
-    let unrounded = tickets as f64 * rate;
-    if !unrounded.is_finite() {
-        return Err(anyhow!(
-            "payout is not finite ({unrounded}) for {tickets} tickets at {rate} stardust/ticket"
-        ));
+/// Values this close to the next whole stardust are treated as having reached
+/// it, so accumulated f64 error can't strand someone just below the threshold
+/// (e.g. ten 0.1s summing to 0.9999999999999999).
+const STARDUST_EPSILON: f64 = 1e-9;
+
+/// Whole stardust to pay for `owed` (= carried remainder + this period's
+/// earnings). Floors so the fraction is carried to the next payout, but never
+/// returns a negative amount.
+fn stardust_to_pay(owed: f64) -> anyhow::Result<i64> {
+    if !owed.is_finite() {
+        return Err(anyhow!("payout amount is not finite ({owed})"));
     }
 
-    let rounded = unrounded.round();
-    if !(0.0..=i64::MAX as f64).contains(&rounded) {
-        return Err(anyhow!(
-            "payout {rounded} is out of range for {tickets} tickets at {rate} stardust/ticket"
-        ));
+    let paid = (owed + STARDUST_EPSILON).floor().max(0.0);
+    if paid > i64::MAX as f64 {
+        return Err(anyhow!("payout {paid} is out of range"));
     }
 
-    Ok(rounded as i64)
+    Ok(paid as i64)
 }
 
-fn justification(tickets: i64, rate: f64) -> String {
-    format!("{tickets} tkts * {rate} sd/tkt")
+fn justification(tickets: i64, rate: f64, carried_in: f64) -> String {
+    let base = format!("{tickets} tkts * {rate} sd/tkt");
+    if carried_in.abs() < STARDUST_EPSILON {
+        base
+    } else if carried_in > 0.0 {
+        format!("{base} + {carried_in:.2} accrued")
+    } else {
+        format!("{base} - {:.2} accrued", -carried_in)
+    }
 }
 
 fn payout_reason(
@@ -489,6 +499,7 @@ fn run_payout(
     stardance_api: &StardanceApi,
 ) -> anyhow::Result<()> {
     let db = get_db(database_file)?;
+    let stardust_carry = load_stardust_carry(&db)?;
 
     let (kind, period_start, period_end, rate, memo, resume) = match resolve_session(&db, &args)? {
         SessionRun::New {
@@ -603,17 +614,13 @@ fn run_payout(
             continue;
         }
 
-        let amount = round_stardust(*tickets, rate)?;
-        let unrounded = *tickets as f64 * rate;
-        if amount == 0 {
-            log(format!(
-                "{slack_id}: {tickets} tickets * {rate} = {unrounded:.2} -> 0 stardust (skipped)"
-            ));
-            continue;
-        }
-
-        planned_count += 1;
-        planned_stardust += amount;
+        let user_id = i64::try_from(user.id)
+            .context("local user ID does not fit in a signed 64-bit integer")?;
+        let earned = *tickets as f64 * rate;
+        let carried_in = stardust_carry.get(&user_id).copied().unwrap_or(0.0);
+        let owed = carried_in + earned;
+        let amount = stardust_to_pay(owed)?;
+        let carried_out = owed - amount as f64;
 
         let reason = payout_reason(
             period_start,
@@ -624,37 +631,39 @@ fn run_payout(
         );
 
         log(format!(
-            "{slack_id} ({}): {tickets} tickets * {rate} = {unrounded:.2} -> {amount} stardust",
+            "{slack_id} ({}): {tickets} tickets * {rate} = {owed:.2} -> {amount} stardust (carrying {carried_out:.2})",
             user.display_name
         ));
         log(&reason);
 
         let Some(session) = &session else {
+            planned_count += usize::from(amount > 0);
+            planned_stardust += amount;
             continue;
         };
 
-        let user_id = i64::try_from(user.id)
-            .context("local user ID does not fit in a signed 64-bit integer")?;
-
         if session.paid_users.contains(&user_id) {
             log(format!(
-                "{slack_id} ({}) already paid in session {}, skipping",
+                "{slack_id} ({}) already recorded in session {}, skipping",
                 user.display_name, session.id
             ));
             continue;
         }
 
-        if args.execute_by_one && !confirm_payout(&user.display_name, amount)? {
-            log(format!(
-                "{slack_id} ({}) skipped by operator",
-                user.display_name
-            ));
-            continue;
-        }
+        if amount > 0 {
+            if args.execute_by_one && !confirm_payout(&user.display_name, amount)? {
+                log(format!(
+                    "{slack_id} ({}) skipped by operator",
+                    user.display_name
+                ));
+                continue;
+            }
 
-        post_balance_adjustment(stardance_api, user.stardance_id, amount, &reason).with_context(
-            || format!("failed to pay {slack_id} ({}): {reason}", user.display_name),
-        )?;
+            post_balance_adjustment(stardance_api, user.stardance_id, amount, &reason)
+                .with_context(|| {
+                    format!("failed to pay {slack_id} ({}): {reason}", user.display_name)
+                })?;
+        }
 
         db.execute(
             "INSERT INTO payout_transaction (session, user, amount, unrounded_amount, justification) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -662,13 +671,13 @@ fn run_payout(
                 session.id,
                 user_id,
                 amount,
-                unrounded,
-                justification(*tickets, rate)
+                earned,
+                justification(*tickets, rate, carried_in)
             ],
         )
         .with_context(|| format!("failed to record payout for {slack_id}"))?;
 
-        paid_count += 1;
+        paid_count += usize::from(amount > 0);
         paid_stardust += amount;
     }
 
@@ -798,6 +807,24 @@ fn load_paid_user_ids(db: &Connection, session_id: i64) -> anyhow::Result<HashSe
     }
 
     Ok(user_ids)
+}
+
+/// Per-user stardust owed from rounding so far: total earned minus total paid.
+/// Users with no transactions (or with no carry) are absent.
+fn load_stardust_carry(db: &Connection) -> anyhow::Result<HashMap<i64, f64>> {
+    let mut stmt = db.prepare(
+        "SELECT user, SUM(unrounded_amount) - SUM(amount)
+         FROM payout_transaction GROUP BY user",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)))?;
+
+    let mut carry = HashMap::new();
+    for row in rows {
+        let (user, owed) = row?;
+        carry.insert(user, owed);
+    }
+
+    Ok(carry)
 }
 
 type SessionRow = (i64, String, String, String, f64, String, Option<String>);
@@ -1218,16 +1245,65 @@ mod tests {
     }
 
     #[test]
-    fn rounds_stardust_to_nearest() {
-        assert_eq!(round_stardust(3, 0.3).expect("valid"), 1);
-        assert_eq!(round_stardust(7, 0.2).expect("valid"), 1);
-        assert_eq!(round_stardust(5, 0.3).expect("valid"), 2);
-        assert_eq!(round_stardust(1, 0.4).expect("valid"), 0);
+    fn floors_stardust_to_pay() {
+        assert_eq!(stardust_to_pay(1.9).expect("valid"), 1);
+        assert_eq!(stardust_to_pay(13.5).expect("valid"), 13);
+        assert_eq!(stardust_to_pay(0.4).expect("valid"), 0);
+    }
+
+    #[test]
+    fn snaps_float_error_to_the_next_stardust() {
+        assert_eq!(stardust_to_pay(0.9999999999999999).expect("valid"), 1);
+        assert_eq!(stardust_to_pay(0.999).expect("valid"), 0);
+    }
+
+    #[test]
+    fn never_pays_a_negative_amount() {
+        assert_eq!(stardust_to_pay(-0.4).expect("valid"), 0);
+        assert_eq!(stardust_to_pay(-12.7).expect("valid"), 0);
+    }
+
+    #[test]
+    fn rejects_non_finite_payouts() {
+        assert!(stardust_to_pay(f64::NAN).is_err());
+        assert!(stardust_to_pay(f64::INFINITY).is_err());
     }
 
     #[test]
     fn formats_justification() {
-        assert_eq!(justification(45, 0.3), "45 tkts * 0.3 sd/tkt");
+        assert_eq!(justification(45, 0.3, 0.0), "45 tkts * 0.3 sd/tkt");
+        assert_eq!(
+            justification(45, 0.3, 0.4),
+            "45 tkts * 0.3 sd/tkt + 0.40 accrued"
+        );
+        assert_eq!(
+            justification(45, 0.3, -0.2),
+            "45 tkts * 0.3 sd/tkt - 0.20 accrued"
+        );
+    }
+
+    #[test]
+    fn carry_accumulates_across_sessions() {
+        let db = test_db();
+        db.execute(
+            "INSERT INTO user (id, stardance_id, slack_id) VALUES (1, 158, 'U1')",
+            [],
+        )
+        .expect("insert user");
+        let first = insert_session(&db, true);
+        let second = insert_session(&db, true);
+        insert_transaction(&db, first, 1, 0, 0.4);
+        insert_transaction(&db, second, 1, 1, 0.7);
+
+        let carry = load_stardust_carry(&db).expect("load carry");
+        assert!((carry[&1] - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn carry_ticks_over_into_a_whole_stardust() {
+        let owed = 0.8 + 0.3;
+        assert_eq!(stardust_to_pay(owed).expect("valid"), 1);
+        assert!((owed - 1.0 - 0.1).abs() < 1e-9);
     }
 
     #[test]
@@ -1307,6 +1383,14 @@ mod tests {
         let db = Connection::open_in_memory().expect("open in-memory database");
         db.execute_batch(SCHEMA).expect("create schema");
         db
+    }
+
+    fn insert_transaction(db: &Connection, session: i64, user: i64, amount: i64, earned: f64) {
+        db.execute(
+            "INSERT INTO payout_transaction (session, user, amount, unrounded_amount, justification) VALUES (?1, ?2, ?3, ?4, '')",
+            rusqlite::params![session, user, amount, earned],
+        )
+        .expect("insert transaction");
     }
 
     fn insert_session(db: &Connection, completed: bool) -> i64 {
