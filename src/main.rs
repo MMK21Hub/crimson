@@ -7,7 +7,7 @@ use clap::{Args, Parser, Subcommand};
 use native_tls::TlsConnector;
 use postgres::Client;
 use postgres_native_tls::MakeTlsConnector;
-use reqwest::Url;
+use reqwest::{StatusCode, Url};
 use rusqlite::Connection;
 use serde::Deserialize;
 use time::OffsetDateTime;
@@ -140,6 +140,77 @@ struct StardanceApi {
     api_key: String,
 }
 
+/// Errors returned by the Stardance API.
+#[derive(Debug)]
+enum StardanceError {
+    /// The server returned 404 for a route that doesn't exist, which almost
+    /// always means `STARDANCE_API_URL` is missing its `/api/v1/` base path.
+    UnknownEndpoint { url: Url },
+
+    /// The server returned 404 from a real endpoint, i.e. the requested record
+    /// (such as a Stardance user) doesn't exist.
+    NotFound { url: Url },
+
+    /// The server returned any other unsuccessful status.
+    UnexpectedStatus { status: StatusCode, body: String },
+}
+
+impl std::fmt::Display for StardanceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownEndpoint { url } => write!(
+                f,
+                "no Stardance API endpoint exists at {url}; check that STARDANCE_API_URL ends in `/api/v1/`"
+            ),
+            Self::NotFound { url } => {
+                write!(f, "Stardance API returned 404 for {url}: no such record")
+            }
+            Self::UnexpectedStatus { status, body } => {
+                write!(f, "Stardance API returned {status}: {body}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StardanceError {}
+
+/// Classifies an unsuccessful response from the Stardance API.
+///
+/// The API serves an HTML "page not found" page for routes that don't exist but
+/// JSON for responses from real endpoints (including 404s for missing records),
+/// so the content type distinguishes a wrong base URL from a missing record.
+fn classify_unsuccessful(
+    status: StatusCode,
+    content_type: Option<&str>,
+    url: Url,
+    body: String,
+) -> StardanceError {
+    let is_json = content_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("application/json"));
+
+    match status {
+        StatusCode::NOT_FOUND if !is_json => StardanceError::UnknownEndpoint { url },
+        StatusCode::NOT_FOUND => StardanceError::NotFound { url },
+        _ => StardanceError::UnexpectedStatus { status, body },
+    }
+}
+
+/// Reads an unsuccessful response into a [`StardanceError`].
+fn stardance_error(response: reqwest::blocking::Response) -> StardanceError {
+    let status = response.status();
+    let url = response.url().clone();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response.text().unwrap_or_default();
+
+    classify_unsuccessful(status, content_type.as_deref(), url, body)
+}
+
 fn log(message: impl AsRef<str>) {
     eprintln!(
         "[{}] {}",
@@ -256,15 +327,8 @@ fn get_stardance_user(api: &StardanceApi, slack_id: &str) -> anyhow::Result<Star
         .header("Authorization", format!("Bearer {}", api.api_key))
         .send()
         .context("Failed to fetch user from Stardance API")?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(anyhow!("No Stardance user found for Slack ID {slack_id}"));
-    }
     if !response.status().is_success() {
-        return Err(anyhow!(
-            "Stardance API returned error: {} - {}",
-            response.status(),
-            response.text().unwrap_or_default()
-        ));
+        return Err(stardance_error(response).into());
     }
     let data: StardanceUser = response
         .json()
@@ -295,11 +359,7 @@ fn post_balance_adjustment(
         .context("Failed to create Stardance balance adjustment")?;
 
     if !response.status().is_success() {
-        return Err(anyhow!(
-            "Stardance API returned error: {} - {}",
-            response.status(),
-            response.text().unwrap_or_default()
-        ));
+        return Err(stardance_error(response).into());
     }
 
     let data: BalanceAdjustmentResponse = response
@@ -1025,8 +1085,9 @@ fn fetch_helpers_from_nephthys(
             continue;
         }
 
-        let stardance_user = get_stardance_user(api, slack_id)
-            .with_context(|| format!("Failed to resolve Stardance user for Nephthys user {id}"))?;
+        let stardance_user = get_stardance_user(api, slack_id).with_context(|| {
+            format!("Failed to resolve Stardance user for Nephthys user {id} (Slack {slack_id})")
+        })?;
 
         users.push(User {
             id: u64::try_from(id).context("Nephthys returned a negative user ID")?,
@@ -1167,6 +1228,45 @@ mod tests {
     #[test]
     fn formats_justification() {
         assert_eq!(justification(45, 0.3), "45 tkts * 0.3 sd/tkt");
+    }
+
+    #[test]
+    fn distinguishes_endpoint_404_from_record_404() {
+        let url = Url::parse("https://stardance.hackclub.com/api/v1/users/lookup?slack_id=U1")
+            .expect("valid URL");
+
+        let unknown_endpoint = classify_unsuccessful(
+            StatusCode::NOT_FOUND,
+            Some("text/html; charset=utf-8"),
+            url.clone(),
+            "<!DOCTYPE html><title>404 - Page Not Found</title>".to_string(),
+        );
+        assert!(matches!(
+            unknown_endpoint,
+            StardanceError::UnknownEndpoint { .. }
+        ));
+
+        let missing_record = classify_unsuccessful(
+            StatusCode::NOT_FOUND,
+            Some("application/json; charset=utf-8"),
+            url,
+            r#"{"error":"Resource not found"}"#.to_string(),
+        );
+        assert!(matches!(missing_record, StardanceError::NotFound { .. }));
+    }
+
+    #[test]
+    fn treats_non_404_failures_as_unexpected() {
+        let url =
+            Url::parse("https://stardance.hackclub.com/api/v1/users/lookup").expect("valid URL");
+
+        let error = classify_unsuccessful(
+            StatusCode::UNAUTHORIZED,
+            Some("application/json"),
+            url,
+            r#"{"error":"Missing Authorization header"}"#.to_string(),
+        );
+        assert!(matches!(error, StardanceError::UnexpectedStatus { .. }));
     }
 
     #[test]

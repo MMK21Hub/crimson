@@ -1,4 +1,5 @@
 - Prefers configurable paths (e.g., database location) exposed as CLI flags with sensible defaults rather than environment variables. Confidence: 0.7
+- Prefers idiomatic Rust style: distinguish similar error cases (e.g. a routing 404 vs. a "record not found" 404) with a typed error enum (sum type) rather than stringly-typed `anyhow!` errors — "in an idiomatic Rust way". Confidence: 0.55
 - Wants configuration values (e.g., an API base URL) to fall back to a sensible built-in default instead of hard-failing when the env var is unset — prefer `.unwrap_or_else(|| default)` over a required-var error. Confidence: 0.6
 - Expects parent directories to be created automatically when a referenced file path doesn't exist (e.g., `create_dir_all` before opening a database file). Confidence: 0.7
 - Prefers race-condition-safe code: avoids check-then-act (e.g., `exists()` before creating) in favor of idempotent atomic operations like `create_dir_all`. Confidence: 0.6
