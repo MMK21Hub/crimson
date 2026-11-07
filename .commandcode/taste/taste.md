@@ -26,4 +26,4 @@
 - Asks terse, minimal-context debugging questions ("how to make this work?") with only the offending line attached via IDE selection, and expects the agent to read the surrounding code, reproduce the compiler error itself, and apply the fix — not to ask clarifying questions first. Confidence: 0.45
 - Prefers operator-controlled overrides (e.g. an `excluded` flag for HQ staff) to live as a column in the local DB that the user edits by hand, defaulting to the safe/off value for everyone; automated sync/upsert logic must not overwrite those manual values. Confidence: 0.65
 - Prefers minimal diffs: dislikes reorganizing/reordering working code (e.g. moving argument parsing to the top of `main`) when the current structure already handles the request — questions changes that aren't strictly necessary. Confidence: 0.6
-- Prefers adding dependencies via `cargo add` (rather than hand-editing Cargo.toml) so the latest version is pulled. Confidence: 0.8
+- Prefers adding dependencies via `cargo add` (rather than hand-editing Cargo.toml) so the latest version is pulled. Confidence: 0.9

@@ -668,7 +668,7 @@ fn run_payout(
         );
 
         log(format!(
-            "{slack_id} ({}): {tickets} tickets * {rate} = {owed:.2} -> {amount} stardust (carrying {carried_out:.2})",
+            "{slack_id} ({}): {tickets} tickets * {rate} = {earned:.2} -> {amount} stardust (carrying {carried_out:.2})",
             user.display_name
         ));
         log(&reason);
