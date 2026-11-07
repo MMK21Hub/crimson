@@ -9,6 +9,7 @@ authors = ["Mish <mish@hackclub.com>"]
 anyhow = "1.0.101"
 clap = { version = "4.5.58", features = ["derive"] }
 dotenvy = "0.15.7"
+humantime = "2.4.0"
 native-tls = "0.2.18"
 postgres = { version = "0.19.12", features = ["with-time-0_3"] }
 postgres-native-tls = "0.5.3"

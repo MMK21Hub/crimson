@@ -38,15 +38,19 @@ struct PayoutArgs {
     #[arg(long)]
     start: Option<String>,
 
-    /// End time (ISO 8601, e.g. 2026-03-01T00:00:00Z). Defaults to now for regular payouts; required for bonus payouts.
+    /// End time (ISO 8601, e.g. 2026-03-01T00:00:00Z). Defaults to now for regular payouts; required for bonus payouts unless --duration is given.
     #[arg(long)]
     end: Option<String>,
+
+    /// Length of the payout period (e.g. `4h30m`), used instead of --end and added to the period start.
+    #[arg(long, conflicts_with = "end")]
+    duration: Option<String>,
 
     /// Stardust paid out per closed ticket
     #[arg(long)]
     stardust_rate: f64,
 
-    /// Make this a one-off bonus payout (requires --start, --end and --message)
+    /// Make this a one-off bonus payout (requires --start and either --end or --duration, plus --message)
     #[arg(long)]
     bonus: bool,
 
@@ -249,6 +253,37 @@ fn parse_time(value: &str) -> anyhow::Result<OffsetDateTime> {
     })?;
 
     Ok(naive.assume_utc())
+}
+
+/// Parses a human duration string such as `4h30m` or `90m`.
+fn parse_duration(value: &str) -> anyhow::Result<Duration> {
+    humantime::parse_duration(value)
+        .with_context(|| format!("invalid duration `{value}`; expected e.g. `4h30m` or `90m`"))
+}
+
+/// Resolves the end of a payout period from an explicit `--end` or a `--duration`
+/// offset from the period start. Returns `None` when neither was given.
+fn resolve_period_end(
+    period_start: OffsetDateTime,
+    end: Option<&str>,
+    duration: Option<&str>,
+) -> anyhow::Result<Option<OffsetDateTime>> {
+    match (end, duration) {
+        (None, None) => Ok(None),
+        (Some(end), None) => Ok(Some(parse_time(end)?)),
+        (Some(_), Some(_)) => Err(anyhow!("--end and --duration cannot be used together")),
+        (None, Some(duration)) => {
+            let offset = time::Duration::try_from(parse_duration(duration)?)
+                .map_err(|_| anyhow!("duration `{duration}` is out of range"))?;
+            let period_end = period_start.checked_add(offset).ok_or_else(|| {
+                anyhow!(
+                    "period start {} plus duration `{duration}` is out of range",
+                    format_time(period_start)
+                )
+            })?;
+            Ok(Some(period_end))
+        }
+    }
 }
 
 /// Values this close to the next whole stardust are treated as having reached
@@ -943,9 +978,9 @@ fn resolve_session(db: &Connection, args: &PayoutArgs) -> anyhow::Result<Session
                 session.kind.as_str()
             ));
         }
-        if args.start.is_some() || args.end.is_some() {
+        if args.start.is_some() || args.end.is_some() || args.duration.is_some() {
             return Err(anyhow!(
-                "payout session {} is incomplete; rerun without --start/--end to resume it",
+                "payout session {} is incomplete; rerun without --start/--end/--duration to resume it",
                 session.id
             ));
         }
@@ -977,14 +1012,9 @@ fn resolve_session(db: &Connection, args: &PayoutArgs) -> anyhow::Result<Session
     }
 
     if requested == SessionType::Bonus {
-        let start = args
-            .start
-            .as_deref()
-            .ok_or_else(|| anyhow!("bonus payouts require both --start and --end"))?;
-        let end = args
-            .end
-            .as_deref()
-            .ok_or_else(|| anyhow!("bonus payouts require both --start and --end"))?;
+        let start = args.start.as_deref().ok_or_else(|| {
+            anyhow!("bonus payouts require --start and either --end or --duration")
+        })?;
         let memo = args
             .message
             .as_deref()
@@ -993,7 +1023,11 @@ fn resolve_session(db: &Connection, args: &PayoutArgs) -> anyhow::Result<Session
             .ok_or_else(|| anyhow!("bonus payouts require a non-empty --message"))?;
 
         let period_start = parse_time(start)?;
-        let period_end = parse_time(end)?;
+        let period_end =
+            resolve_period_end(period_start, args.end.as_deref(), args.duration.as_deref())?
+                .ok_or_else(|| {
+                    anyhow!("bonus payouts require --start and either --end or --duration")
+                })?;
         if period_end <= period_start {
             return Err(anyhow!(
                 "period end {} must be after period start {}",
@@ -1038,10 +1072,11 @@ fn resolve_session(db: &Connection, args: &PayoutArgs) -> anyhow::Result<Session
         ));
     }
 
-    let period_end = match &args.end {
-        Some(value) => parse_time(value)?,
-        None => OffsetDateTime::now_utc(),
-    };
+    let period_end =
+        match resolve_period_end(period_start, args.end.as_deref(), args.duration.as_deref())? {
+            Some(period_end) => period_end,
+            None => OffsetDateTime::now_utc(),
+        };
 
     if period_end <= period_start {
         return Err(anyhow!(
@@ -1244,6 +1279,19 @@ mod tests {
     #[test]
     fn rejects_invalid_timestamps() {
         assert!(parse_time("not a time").is_err());
+    }
+
+    #[test]
+    fn parses_duration_strings() {
+        assert_eq!(
+            parse_duration("4h30m").expect("valid duration"),
+            Duration::from_secs(4 * 3600 + 30 * 60)
+        );
+        assert_eq!(
+            parse_duration("90m").expect("valid duration"),
+            Duration::from_secs(90 * 60)
+        );
+        assert!(parse_duration("not a duration").is_err());
     }
 
     #[test]
@@ -1450,6 +1498,7 @@ mod tests {
         let args = PayoutArgs {
             start: None,
             end: None,
+            duration: None,
             stardust_rate: 0.4,
             bonus: false,
             message: None,
@@ -1472,6 +1521,7 @@ mod tests {
         let args = PayoutArgs {
             start: None,
             end: None,
+            duration: None,
             stardust_rate: 0.4,
             bonus: false,
             message: None,
@@ -1490,6 +1540,76 @@ mod tests {
     }
 
     #[test]
+    fn duration_sets_period_end_from_period_start() {
+        let db = test_db();
+        insert_session(&db, true);
+        let args = PayoutArgs {
+            start: None,
+            end: None,
+            duration: Some("4h30m".to_string()),
+            stardust_rate: 0.4,
+            bonus: false,
+            message: None,
+            execute: false,
+            execute_by_one: false,
+        };
+
+        let resolved = resolve_session(&db, &args).expect("resolve session");
+        let expected_start = parse_time("2026-10-08T00:00:00Z").expect("valid timestamp");
+        let expected_end = parse_time("2026-10-08T04:30:00Z").expect("valid timestamp");
+        assert!(
+            matches!(
+                resolved,
+                SessionRun::New { period_start, period_end, .. }
+                    if period_start == expected_start && period_end == expected_end
+            ),
+            "expected a new session spanning the given duration"
+        );
+    }
+
+    #[test]
+    fn bonus_accepts_duration_instead_of_end() {
+        let db = test_db();
+        let args = PayoutArgs {
+            start: Some("2026-10-25T01:18:00Z".to_string()),
+            end: None,
+            duration: Some("2h40m".to_string()),
+            stardust_rate: 0.4,
+            bonus: true,
+            message: Some("25 Oct lock-in huddle".to_string()),
+            execute: false,
+            execute_by_one: false,
+        };
+
+        let resolved = resolve_session(&db, &args).expect("resolve session");
+        let expected_end = parse_time("2026-10-25T03:58:00Z").expect("valid timestamp");
+        assert!(
+            matches!(
+                resolved,
+                SessionRun::New { period_end, .. } if period_end == expected_end
+            ),
+            "expected a bonus session ending one duration after the start"
+        );
+    }
+
+    #[test]
+    fn rejects_end_and_duration_together() {
+        let db = test_db();
+        let args = PayoutArgs {
+            start: Some("2026-10-01T00:00:00Z".to_string()),
+            end: Some("2026-10-02T00:00:00Z".to_string()),
+            duration: Some("1h".to_string()),
+            stardust_rate: 0.4,
+            bonus: false,
+            message: None,
+            execute: false,
+            execute_by_one: false,
+        };
+
+        assert!(resolve_session(&db, &args).is_err());
+    }
+
+    #[test]
     fn rejects_out_of_order_completed_sessions() {
         let db = test_db();
         insert_session_with_period(&db, "2026-03-01T00:00:00Z", "2026-04-01T00:00:00Z", true);
@@ -1498,6 +1618,7 @@ mod tests {
         let args = PayoutArgs {
             start: None,
             end: None,
+            duration: None,
             stardust_rate: 0.4,
             bonus: false,
             message: None,
@@ -1533,6 +1654,7 @@ mod tests {
         let args = PayoutArgs {
             start: None,
             end: None,
+            duration: None,
             stardust_rate: 0.4,
             bonus: true,
             message: None,
@@ -1560,6 +1682,7 @@ mod tests {
         let args = PayoutArgs {
             start: None,
             end: None,
+            duration: None,
             stardust_rate: 0.4,
             bonus: false,
             message: None,
@@ -1592,6 +1715,7 @@ mod tests {
         let regular = PayoutArgs {
             start: None,
             end: None,
+            duration: None,
             stardust_rate: 0.4,
             bonus: false,
             message: None,
@@ -1603,6 +1727,7 @@ mod tests {
         let bonus = PayoutArgs {
             start: None,
             end: None,
+            duration: None,
             stardust_rate: 0.4,
             bonus: true,
             message: None,
