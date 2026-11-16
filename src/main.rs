@@ -1036,6 +1036,31 @@ fn resolve_session(db: &Connection, args: &PayoutArgs) -> anyhow::Result<Session
             ));
         }
 
+        let duplicate = query_sessions(
+            db,
+            "SELECT id, type, period_start, period_end, stardust_rate, started_at, memo
+             FROM payout_session
+             WHERE type = 'bonus'
+             ORDER BY id",
+        )?
+        .into_iter()
+        .find(|session| {
+            session
+                .memo
+                .as_deref()
+                .is_some_and(|existing| existing.trim().eq_ignore_ascii_case(memo))
+        });
+
+        if let Some(session) = duplicate {
+            return Err(anyhow!(
+                "bonus payout session {} already used the memo `{}` for {} .. {}; pass a different --message to avoid paying out the same bonus twice",
+                session.id,
+                session.memo.as_deref().unwrap_or_default(),
+                format_time(session.period_start),
+                format_time(session.period_end)
+            ));
+        }
+
         return Ok(SessionRun::New {
             kind: SessionType::Bonus,
             period_start,
@@ -1663,6 +1688,70 @@ mod tests {
         };
 
         assert!(resolve_session(&db, &args).is_err());
+    }
+
+    #[test]
+    fn rejects_bonus_reusing_an_existing_memo() {
+        let db = test_db();
+        let existing = insert_session_of_type(
+            &db,
+            SessionType::Bonus,
+            "2026-11-07T21:33:00Z",
+            "2026-11-07T23:18:00Z",
+            true,
+            Some("7 Nov lock-in huddle"),
+        );
+
+        let args = PayoutArgs {
+            start: Some("2026-11-15T03:56:00Z".to_string()),
+            end: Some("2026-11-15T04:19:00Z".to_string()),
+            duration: None,
+            stardust_rate: 0.4,
+            bonus: true,
+            message: Some("  7 nov lock-in huddle  ".to_string()),
+            execute: false,
+            execute_by_one: false,
+        };
+
+        let error = resolve_session(&db, &args)
+            .err()
+            .expect("a duplicate memo should be rejected");
+        let message = error.to_string();
+        assert!(message.contains(&existing.to_string()), "{message}");
+        assert!(message.contains("7 Nov lock-in huddle"), "{message}");
+    }
+
+    #[test]
+    fn allows_bonus_with_a_new_memo() {
+        let db = test_db();
+        insert_session_of_type(
+            &db,
+            SessionType::Bonus,
+            "2026-11-07T21:33:00Z",
+            "2026-11-07T23:18:00Z",
+            true,
+            Some("7 Nov lock-in huddle"),
+        );
+
+        let args = PayoutArgs {
+            start: Some("2026-11-15T03:56:00Z".to_string()),
+            end: Some("2026-11-15T04:19:00Z".to_string()),
+            duration: None,
+            stardust_rate: 0.4,
+            bonus: true,
+            message: Some("15 Nov lock-in huddle".to_string()),
+            execute: false,
+            execute_by_one: false,
+        };
+
+        let resolved = resolve_session(&db, &args).expect("resolve session");
+        assert!(
+            matches!(
+                resolved,
+                SessionRun::New { memo: Some(ref memo), .. } if memo == "15 Nov lock-in huddle"
+            ),
+            "a new memo should be accepted"
+        );
     }
 
     #[test]
