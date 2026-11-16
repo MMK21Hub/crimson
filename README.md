@@ -72,6 +72,8 @@ cargo run -- payout --bonus \
 
 Bonus sessions are recorded like regular ones, but are ignored when calculating the next regular payout's start date, so they can overlap regular periods. Add `--execute` to actually send one.
 
+Memos identify a bonus, so they must be unique across bonus sessions: reusing one (ignoring case and surrounding whitespace) is rejected instead of paying out the same bonus twice.
+
 #### Excluding people from payouts
 
 People who are paid to work on Stardance are excluded from payouts, since they get paid Actual Money&trade; to answer questions. To accomplish this, set `excluded` to `1` in the database for all users who should be excluded. This has to be done after the [users table is initialised](#fetching-helper-info).
